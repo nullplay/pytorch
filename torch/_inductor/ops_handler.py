@@ -718,6 +718,10 @@ class OpsHandler(Generic[T]):
     # halide-only
     def halide_clamp(self, value: T, size: sympy.Expr, check: bool) -> T:
         raise NotImplementedError
+    
+    # triton-only
+    def dot(self, x: T, y: T) -> T:
+        raise NotImplementedError
 
     # triton-only
     def inline_asm_elementwise(
