@@ -1799,12 +1799,39 @@ def pointwise(
         filename=filename,
     )
 
+# Warning : num_stages > 1 compilation fails with current triton compiler.
+# https://github.com/triton-lang/triton/issues/5882
+triton_dot_reduction_configs = [  
+    Config({'XBLOCK': 32, 'YBLOCK': 32, 'R0_BLOCK': 16}, num_warps=2, num_stages=1),
+    Config({'XBLOCK': 32, 'YBLOCK': 32, 'R0_BLOCK': 128}, num_warps=4, num_stages=1),
+    Config({'XBLOCK': 32, 'YBLOCK': 64, 'R0_BLOCK': 32}, num_warps=8, num_stages=1),
+    Config({'XBLOCK': 64, 'YBLOCK': 32, 'R0_BLOCK': 32}, num_warps=8, num_stages=1),
+    Config({'XBLOCK': 64, 'YBLOCK': 32, 'R0_BLOCK': 128}, num_warps=4, num_stages=1),
+    Config({'XBLOCK': 64, 'YBLOCK': 64, 'R0_BLOCK': 16}, num_warps=4, num_stages=1),
+    Config({'XBLOCK': 64, 'YBLOCK': 64, 'R0_BLOCK': 32}, num_warps=4, num_stages=1),
+    Config({'XBLOCK': 64, 'YBLOCK': 64, 'R0_BLOCK': 64}, num_warps=8, num_stages=1),
+    Config({'XBLOCK': 64, 'YBLOCK': 64, 'R0_BLOCK': 128}, num_warps=4, num_stages=1),
+    Config({'XBLOCK': 64, 'YBLOCK': 128, 'R0_BLOCK': 32}, num_warps=4, num_stages=1),
+    Config({'XBLOCK': 64, 'YBLOCK': 128, 'R0_BLOCK': 32}, num_warps=8, num_stages=1),
+    Config({'XBLOCK': 64, 'YBLOCK': 128, 'R0_BLOCK': 64}, num_warps=4, num_stages=1),
+    Config({'XBLOCK': 64, 'YBLOCK': 128, 'R0_BLOCK': 128}, num_warps=4, num_stages=1),
+    Config({'XBLOCK': 128, 'YBLOCK': 64, 'R0_BLOCK': 32}, num_warps=4, num_stages=1),
+    Config({'XBLOCK': 128, 'YBLOCK': 64, 'R0_BLOCK': 32}, num_warps=8, num_stages=1),
+    Config({'XBLOCK': 128, 'YBLOCK': 128, 'R0_BLOCK': 32}, num_warps=8, num_stages=1),
+    Config({'XBLOCK': 128, 'YBLOCK': 128, 'R0_BLOCK': 32}, num_warps=4, num_stages=1),
+    Config({'XBLOCK': 128, 'YBLOCK': 128, 'R0_BLOCK': 64}, num_warps=4, num_stages=1),
+    Config({'XBLOCK': 128, 'YBLOCK': 128, 'R0_BLOCK': 64}, num_warps=8, num_stages=1),
+]
+
 
 def _reduction_configs(
-    *, size_hints: dict[str, int], inductor_meta: dict[str, Any]
+    *, 
+    size_hints: dict[str, int], 
+    inductor_meta: dict[str, Any], 
+    triton_meta: dict[str, Any],
 ) -> list[Config]:
     reduction_hint = inductor_meta.get("reduction_hint", None)
-
+    
     # Convert reductions to 1D, to simplify heuristics.
     rnumel = get_total_reduction_numel(size_hints)
 
@@ -1846,6 +1873,9 @@ def _reduction_configs(
         register_intensive=register_intensive,
     )
     
+    if triton_meta["dot_reduction"] :
+        return triton_dot_reduction_configs
+
     if inductor_meta.get("max_autotune") or inductor_meta.get("max_autotune_pointwise"):
         pass  # skip all these cases
     elif reduction_hint == ReductionHint.INNER:
@@ -1857,27 +1887,6 @@ def _reduction_configs(
     if disable_pointwise_autotuning(inductor_meta):
         return [triton_config_reduction(size_hints, 32, 128)]
 
-    return [ # Warning
-        Config({'XBLOCK': 32, 'YBLOCK': 32, 'R0_BLOCK': 16}, num_warps=2, num_stages=1),
-        Config({'XBLOCK': 32, 'YBLOCK': 32, 'R0_BLOCK': 128}, num_warps=4, num_stages=1),
-        Config({'XBLOCK': 32, 'YBLOCK': 64, 'R0_BLOCK': 32}, num_warps=8, num_stages=1),
-        Config({'XBLOCK': 64, 'YBLOCK': 32, 'R0_BLOCK': 32}, num_warps=8, num_stages=1),
-        Config({'XBLOCK': 64, 'YBLOCK': 32, 'R0_BLOCK': 128}, num_warps=4, num_stages=1),
-        Config({'XBLOCK': 64, 'YBLOCK': 64, 'R0_BLOCK': 16}, num_warps=4, num_stages=1),
-        Config({'XBLOCK': 64, 'YBLOCK': 64, 'R0_BLOCK': 32}, num_warps=4, num_stages=1),
-        Config({'XBLOCK': 64, 'YBLOCK': 64, 'R0_BLOCK': 64}, num_warps=8, num_stages=1),
-        Config({'XBLOCK': 64, 'YBLOCK': 64, 'R0_BLOCK': 128}, num_warps=4, num_stages=1),
-        Config({'XBLOCK': 64, 'YBLOCK': 128, 'R0_BLOCK': 32}, num_warps=4, num_stages=1),
-        Config({'XBLOCK': 64, 'YBLOCK': 128, 'R0_BLOCK': 32}, num_warps=8, num_stages=1),
-        Config({'XBLOCK': 64, 'YBLOCK': 128, 'R0_BLOCK': 64}, num_warps=4, num_stages=1),
-        Config({'XBLOCK': 64, 'YBLOCK': 128, 'R0_BLOCK': 128}, num_warps=4, num_stages=1),
-        Config({'XBLOCK': 128, 'YBLOCK': 64, 'R0_BLOCK': 32}, num_warps=4, num_stages=1),
-        Config({'XBLOCK': 128, 'YBLOCK': 64, 'R0_BLOCK': 32}, num_warps=8, num_stages=1),
-        Config({'XBLOCK': 128, 'YBLOCK': 128, 'R0_BLOCK': 32}, num_warps=8, num_stages=1),
-        Config({'XBLOCK': 128, 'YBLOCK': 128, 'R0_BLOCK': 32}, num_warps=4, num_stages=1),
-        Config({'XBLOCK': 128, 'YBLOCK': 128, 'R0_BLOCK': 64}, num_warps=4, num_stages=1),
-        Config({'XBLOCK': 128, 'YBLOCK': 128, 'R0_BLOCK': 64}, num_warps=8, num_stages=1),
-    ]
     return [
         contiguous_config,
         outer_config,
@@ -1889,7 +1898,6 @@ def _reduction_configs(
         # is quite heavy. E.g. https://gist.github.com/shunting314/189a8ef69f90db9d614a823385147a72
         triton_config_reduction(size_hints, 64, 4, num_warps=8),
     ]
-
 
 def reduction(
     size_hints,
@@ -1906,7 +1914,13 @@ def reduction(
 
     assert triton_meta is not None
 
-    configs = _reduction_configs(size_hints=size_hints, inductor_meta=inductor_meta)
+
+    configs = _reduction_configs(
+        size_hints=size_hints, 
+        inductor_meta=inductor_meta,
+        triton_meta=triton_meta
+    )
+    
     return cached_autotune(
         size_hints,
         configs=configs,

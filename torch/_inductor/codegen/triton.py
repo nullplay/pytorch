@@ -3494,6 +3494,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             "signature": triton_meta_signature,
             "device": DeviceProperties.create(V.graph.get_current_device_or_throw()),
             "constants": {},
+            "dot_reduction": "tl.dot" in str(self.compute),
         }
 
         # Skip memory optimization for forward of the training loop where we expect
