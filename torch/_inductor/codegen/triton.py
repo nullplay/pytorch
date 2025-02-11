@@ -1015,8 +1015,7 @@ class TritonOverrides(OpOverrides):
 
         a_transposed = f"{a_squeezed}.permute(1,0)" #(R,Y)
 
-        #return f"tl.dot({b_squeezed}, {a_transposed})"
-        return f"tl.dot({a}, {b})"
+        return f"tl.dot({b_squeezed}, {a_transposed})"
 
     @staticmethod
     def inline_asm_elementwise(
