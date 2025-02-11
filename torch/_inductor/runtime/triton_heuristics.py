@@ -1659,10 +1659,12 @@ def triton_config_reduction(
     # WARNING : Test
     x = max(x, 16)
     rnumels = {key: max(16, val) for key, val in rnumels.items()}
-
     cfg = _get_config({"x": x, "y": x, **rnumels})
     check_max_block(cfg)
     check_config(cfg, xnumel=size_hints["x"], ynumel=size_hints["y"])
+    #cfg = _get_config({"x": x, **rnumels})
+    #check_max_block(cfg)
+    #check_config(cfg, xnumel=size_hints["x"])
     return Config(cfg, num_warps=num_warps, num_stages=num_stages)
 
 
@@ -1843,6 +1845,7 @@ def _reduction_configs(
         min(rnumel, MAX_R0_BLOCK),
         register_intensive=register_intensive,
     )
+    
     if inductor_meta.get("max_autotune") or inductor_meta.get("max_autotune_pointwise"):
         pass  # skip all these cases
     elif reduction_hint == ReductionHint.INNER:
@@ -1853,6 +1856,28 @@ def _reduction_configs(
         return [tiny_config]
     if disable_pointwise_autotuning(inductor_meta):
         return [triton_config_reduction(size_hints, 32, 128)]
+
+    return [ # Warning
+        Config({'XBLOCK': 32, 'YBLOCK': 32, 'R0_BLOCK': 16}, num_warps=2, num_stages=1),
+        Config({'XBLOCK': 32, 'YBLOCK': 32, 'R0_BLOCK': 128}, num_warps=4, num_stages=1),
+        Config({'XBLOCK': 32, 'YBLOCK': 64, 'R0_BLOCK': 32}, num_warps=8, num_stages=1),
+        Config({'XBLOCK': 64, 'YBLOCK': 32, 'R0_BLOCK': 32}, num_warps=8, num_stages=1),
+        Config({'XBLOCK': 64, 'YBLOCK': 32, 'R0_BLOCK': 128}, num_warps=4, num_stages=1),
+        Config({'XBLOCK': 64, 'YBLOCK': 64, 'R0_BLOCK': 16}, num_warps=4, num_stages=1),
+        Config({'XBLOCK': 64, 'YBLOCK': 64, 'R0_BLOCK': 32}, num_warps=4, num_stages=1),
+        Config({'XBLOCK': 64, 'YBLOCK': 64, 'R0_BLOCK': 64}, num_warps=8, num_stages=1),
+        Config({'XBLOCK': 64, 'YBLOCK': 64, 'R0_BLOCK': 128}, num_warps=4, num_stages=1),
+        Config({'XBLOCK': 64, 'YBLOCK': 128, 'R0_BLOCK': 32}, num_warps=4, num_stages=1),
+        Config({'XBLOCK': 64, 'YBLOCK': 128, 'R0_BLOCK': 32}, num_warps=8, num_stages=1),
+        Config({'XBLOCK': 64, 'YBLOCK': 128, 'R0_BLOCK': 64}, num_warps=4, num_stages=1),
+        Config({'XBLOCK': 64, 'YBLOCK': 128, 'R0_BLOCK': 128}, num_warps=4, num_stages=1),
+        Config({'XBLOCK': 128, 'YBLOCK': 64, 'R0_BLOCK': 32}, num_warps=4, num_stages=1),
+        Config({'XBLOCK': 128, 'YBLOCK': 64, 'R0_BLOCK': 32}, num_warps=8, num_stages=1),
+        Config({'XBLOCK': 128, 'YBLOCK': 128, 'R0_BLOCK': 32}, num_warps=8, num_stages=1),
+        Config({'XBLOCK': 128, 'YBLOCK': 128, 'R0_BLOCK': 32}, num_warps=4, num_stages=1),
+        Config({'XBLOCK': 128, 'YBLOCK': 128, 'R0_BLOCK': 64}, num_warps=4, num_stages=1),
+        Config({'XBLOCK': 128, 'YBLOCK': 128, 'R0_BLOCK': 64}, num_warps=8, num_stages=1),
+    ]
     return [
         contiguous_config,
         outer_config,

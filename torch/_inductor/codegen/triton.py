@@ -1013,8 +1013,9 @@ class TritonOverrides(OpOverrides):
         a_squeezed = triton_reshape(str(a), [1,Y,R], [Y,R]) # (Y,R)
         b_squeezed = triton_reshape(str(b), [X,1,R], [X,R]) # (X,R)
 
-        a_transposed = f"{a_squeezed}.permute(1,0)" #(R,Y)
+        a_transposed = f"tl.trans({a_squeezed})" #(R,Y)
 
+        #return f"tl.dot({b_squeezed}, {a_transposed}, allow_tf32=True)"
         return f"tl.dot({b_squeezed}, {a_transposed})"
 
     @staticmethod
