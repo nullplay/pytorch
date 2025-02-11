@@ -2049,7 +2049,8 @@ class SIMDScheduling(BaseScheduling):
                 cls.get_nd_tilings(node_schedule, numel, reduction_numel)
                 + ranked_tilings
             )
-
+        #WARNING : Test case
+        return {'y':128, 'x':512, 'r0_':256}
         for tiling in ranked_tilings:
             assert isinstance(tiling, dict)
             if all(

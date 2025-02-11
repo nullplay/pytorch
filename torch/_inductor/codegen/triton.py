@@ -1003,6 +1003,19 @@ class TritonOverrides(OpOverrides):
 
     @staticmethod
     def dot(a, b):
+        # a = (1,YBLOCK,RBLOCK)
+        # b = (XBLOCK,1,RBLOCK)
+        dense_sizes = V.kernel.dense_size_list()
+        X = dense_sizes[0]
+        Y = dense_sizes[1]
+        R = dense_sizes[2]
+        
+        a_squeezed = triton_reshape(str(a), [1,Y,R], [Y,R]) # (Y,R)
+        b_squeezed = triton_reshape(str(b), [X,1,R], [X,R]) # (X,R)
+
+        a_transposed = f"{a_squeezed}.permute(1,0)" #(R,Y)
+
+        #return f"tl.dot({b_squeezed}, {a_transposed})"
         return f"tl.dot({a}, {b})"
 
     @staticmethod
@@ -2436,7 +2449,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                     f"{module}.{reduction_type}2({value}, {dim})"
                 )
             elif reduction_type == "dot" :
-                value = f"{value}"
+                value = f"{value}[:,:,None]" # (X,Y) to (X,Y,1)
             else:
                 value = self.reduction_resize(
                     f"{module}.{reduction_type}({value}, {dim})"
@@ -2587,9 +2600,14 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             else:
                 combine_fn = ir.get_reduction_combine_fn(reduction_type, src_dtype)
                 updated = combine_fn(accumulator, value)
-                self.compute.writeline(
-                    f"{accumulator} = {where_cond(updated, accumulator)}"
-                )
+                if reduction_type == "dot" :
+                    self.compute.writeline(
+                        f"{accumulator} = {updated}"
+                    )
+                else :
+                    self.compute.writeline(
+                        f"{accumulator} = {where_cond(updated, accumulator)}"
+                    )
 
                 if src_dtype == torch.bool:
                     # This is only really used for aten.any. It changes the

@@ -1634,7 +1634,7 @@ def triton_config_reduction(
     target = total_numel()
     if conditional_product(*size_hints.values()) < target:
         target //= 8
-
+    
     # if we are below original block size, scale up where we can
     while x < size_hints["x"] and total_numel() < target:
         x *= 2
@@ -1655,10 +1655,14 @@ def triton_config_reduction(
             if rnumels[prefix] == 1:
                 break
             rnumels[prefix] //= 2
+    
+    # WARNING : Test
+    x = max(x, 16)
+    rnumels = {key: max(16, val) for key, val in rnumels.items()}
 
-    cfg = _get_config({"x": x, **rnumels})
+    cfg = _get_config({"x": x, "y": x, **rnumels})
     check_max_block(cfg)
-    check_config(cfg, xnumel=size_hints["x"])
+    check_config(cfg, xnumel=size_hints["x"], ynumel=size_hints["y"])
     return Config(cfg, num_warps=num_warps, num_stages=num_stages)
 
 
