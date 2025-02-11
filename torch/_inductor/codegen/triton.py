@@ -2399,7 +2399,14 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         # tmp0 in the triton code is either a scalar, or single-element tensor
         # so if we emit tl.sum directly, it will only give 1 instead of RBLOCK * 1
         # To avoid this, we broadcast to the expected shape first.
-        dense_size_str = self.dense_size_str()
+        dense_size_str : str
+        if reduction_type == "dot" :
+            dense_sizes = self.dense_size_list()
+            xyz_sizes_only = [ size for size in dense_sizes if "R" not in size ]
+            dense_size_str = f"[{', '.join(xyz_sizes_only)}]"
+        else :
+            dense_size_str = self.dense_size_str()
+
         value = self._map_tuple_or_scalar(
             lambda v: self.cse.generate(
                 self.compute,
@@ -2428,6 +2435,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 value = self.reduction_resize(
                     f"{module}.{reduction_type}2({value}, {dim})"
                 )
+            elif reduction_type == "dot" :
+                value = f"{value}"
             else:
                 value = self.reduction_resize(
                     f"{module}.{reduction_type}({value}, {dim})"
@@ -2538,9 +2547,17 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             default = ir.Reduction.default_accumulator(reduction_type, src_dtype)
             default = self._map_tuple_or_scalar(constant_repr, default)
             if not isinstance(default, tuple):
-                self.body.writeline(
-                    f"{accumulator} = tl.full({self.dense_size_str()}, {default}, {acc_type})"
-                )
+                if reduction_type == "dot" :
+                    dense_sizes = self.dense_size_list()
+                    xyz_sizes_only = [ size for size in dense_sizes if "R" not in size ]
+                    dense_size_str = f"[{', '.join(xyz_sizes_only)}]"
+                    self.body.writeline(
+                        f"{accumulator} = tl.full({dense_size_str}, {default}, {acc_type})"
+                    )
+                else :
+                    self.body.writeline(
+                        f"{accumulator} = tl.full({self.dense_size_str()}, {default}, {acc_type})"
+                    )
 
             if reduction_type in ("argmax", "argmin"):
                 accumulator_index = f"_{result_var}_index"
