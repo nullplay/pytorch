@@ -1959,6 +1959,17 @@ class SIMDScheduling(BaseScheduling):
             `(tile1, tile2, reduction_numel)` s.t. `tile1 * tile2 == numel`
 
         """
+        # If this is a dot reduction (A[M,K] @ B[K,N]),
+        # force tiling to be {'y':M, 'x':N, 'r0_':K}
+        for node in EnableReduction.filter(node_schedule):
+            if node.node.get_reduction_type() == "dot" :
+                node_ranges = node.get_ranges()
+                range_y_x = node_ranges[0] #(M,N)
+                range_r = node_ranges[1]   #(K)
+                tiling =  cls.create_tiling(range_y_x, range_r)
+                return tiling
+
+ 
         # If this is a reduction, only tile reduction dims.
         is_pointwise = reduction_numel == 1
 
@@ -1999,17 +2010,7 @@ class SIMDScheduling(BaseScheduling):
             candidate_tiling.tiling
             for candidate_tiling, score in candidate_tiles.most_common()
         ]
-
-        # If this is a dot reduction (A[M,K] @ B[K,N]),
-        # force tiling to be {'y':M, 'x':N, 'r0_':K}
-        for node in EnableReduction.filter(node_schedule):
-            if node.node.get_reduction_type() == "dot" :
-                node_ranges = node.get_ranges()
-                range_y_x = node_ranges[0] #(M,N)
-                range_r = node_ranges[1]   #(K)
-                tiling =  cls.create_tiling(range_y_x, range_r)
-                return tiling
-        
+       
         if config.triton.max_tiles >= 3 and is_pointwise:
             # Consider adding a third dimension of tiling, but only
             # when a1 is a multiple of b1; otherwise, you have a lot

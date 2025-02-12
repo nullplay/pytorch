@@ -1003,20 +1003,44 @@ class TritonOverrides(OpOverrides):
 
     @staticmethod
     def dot(a, b):
-        # a = (1,YBLOCK,RBLOCK)
-        # b = (XBLOCK,1,RBLOCK)
         dense_sizes = V.kernel.dense_size_list()
-        X = dense_sizes[0]
-        Y = dense_sizes[1]
-        R = dense_sizes[2]
         
-        a_squeezed = triton_reshape(str(a), [1,Y,R], [Y,R]) # (Y,R)
-        b_squeezed = triton_reshape(str(b), [X,1,R], [X,R]) # (X,R)
+        # mm case
+        if len(dense_sizes) == 3:
+            X = dense_sizes[0]
+            Y = dense_sizes[1]
+            R = dense_sizes[2]
 
-        a_transposed = f"tl.trans({a_squeezed})" #(R,Y)
+            # a = (1,YBLOCK,RBLOCK)
+            # b = (XBLOCK,1,RBLOCK)
+            a_squeezed = triton_reshape(str(a), [1,Y,R], [Y,R]) # (Y,R)
+            b_squeezed = triton_reshape(str(b), [X,1,R], [X,R]) # (X,R)
 
-        #return f"tl.dot({b_squeezed}, {a_transposed}, allow_tf32=True)"
-        return f"tl.dot({b_squeezed}, {a_transposed})"
+            a_transposed = f"tl.trans({a_squeezed})" #(R,Y)
+
+            return f"tl.dot({b_squeezed}, {a_transposed})" #(X,Y)
+
+        # bmm case
+        elif len(dense_sizes) == 4 :
+            X = dense_sizes[0]
+            Y = dense_sizes[1]
+            Z = dense_sizes[2]
+            R = dense_sizes[3]
+
+            # a = (1,YBLOCK,ZBLOCK,RBLOCK)
+            # b = (XBLOCK,1,ZBLOCK,RBLOCK)
+            # Note that, autotuner config will always ensure ZBLOCK=1
+            a_squeezed = triton_reshape(str(a), [1,Y,1,R], [Y,R]) 
+            b_squeezed = triton_reshape(str(b), [X,1,1,R], [X,R]) 
+            
+            a_transposed = f"tl.trans({a_squeezed})" #(R,Y)
+
+            return f"tl.dot({b_squeezed}, {a_transposed})" #(X,Y)
+
+        else :
+            raise NotImplementedError("tl.dot can only do mm and bmm") 
+
+
 
     @staticmethod
     def inline_asm_elementwise(
@@ -2406,17 +2430,29 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             masks.append(self._load_mask)
         reduction_range_prefix = self.range_trees[-1].prefix[0]
 
-        # Say we have
+        # Note1 : Say we have
         #     tmp0 = ops.constant(1, torch.int64)
         #     tmp1 = ops.reduction(torch.int64, torch.int64, "sum", tmp0)
         # tmp0 in the triton code is either a scalar, or single-element tensor
         # so if we emit tl.sum directly, it will only give 1 instead of RBLOCK * 1
         # To avoid this, we broadcast to the expected shape first.
+        #
+        # Note2 : When there is a dot reduction,
+        # we don't want to keep the R0_BLOCK/R1_BLOCK in the accumulator.
+        # so instead of naively calling dense_size_str(), we filter out
+        # reduction block from accumulator. 
+        # In bmm (Z,X,R)x(Z,R,Y) case, we also remove z dimension from accumulator
+        # because 3d (Z,X,Y) tl.dot is somehow slower than 2d (X,Y) tl.dot.
+        # We force ZBLOCK to be always 1 during autotune.
         dense_size_str : str
         if reduction_type == "dot" :
             dense_sizes = self.dense_size_list()
-            xyz_sizes_only = [ size for size in dense_sizes if "R" not in size ]
-            dense_size_str = f"[{', '.join(xyz_sizes_only)}]"
+            assert len(dense_sizes) >= 3
+            xy_sizes_only = [ 
+                size for size in dense_sizes 
+                if "X" in size or "Y" in size
+            ]
+            dense_size_str = f"[{', '.join(xy_sizes_only)}]"
         else :
             dense_size_str = self.dense_size_str()
 
@@ -2449,7 +2485,11 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                     f"{module}.{reduction_type}2({value}, {dim})"
                 )
             elif reduction_type == "dot" :
-                value = f"{value}[:,:,None]" # (X,Y) to (X,Y,1)
+                is_bmm = len(self.dense_size_list()) == 4
+                if is_bmm :
+                    value = f"{value}[:,:,None,None]" # (X,Y) to (X,Y,1,1)
+                else :
+                    value = f"{value}[:,:,None]" # (X,Y) to (X,Y,1)
             else:
                 value = self.reduction_resize(
                     f"{module}.{reduction_type}({value}, {dim})"
@@ -2562,8 +2602,12 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             if not isinstance(default, tuple):
                 if reduction_type == "dot" :
                     dense_sizes = self.dense_size_list()
-                    xyz_sizes_only = [ size for size in dense_sizes if "R" not in size ]
-                    dense_size_str = f"[{', '.join(xyz_sizes_only)}]"
+                    assert len(dense_sizes) >= 3
+                    xy_sizes_only = [ 
+                        size for size in dense_sizes 
+                        if "X" in size or "Y" in size
+                    ]
+                    dense_size_str = f"[{', '.join(xy_sizes_only)}]"
                     self.body.writeline(
                         f"{accumulator} = tl.full({dense_size_str}, {default}, {acc_type})"
                     )
@@ -3494,7 +3538,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             "signature": triton_meta_signature,
             "device": DeviceProperties.create(V.graph.get_current_device_or_throw()),
             "constants": {},
-            "dot_reduction": "tl.dot" in str(self.compute),
+            "dot_reduction": "tl.dot" in str(self.body) or "tl.dot" in str(self.compute),
         }
 
         # Skip memory optimization for forward of the training loop where we expect

@@ -1656,15 +1656,9 @@ def triton_config_reduction(
                 break
             rnumels[prefix] //= 2
     
-    # WARNING : Test
-    x = max(x, 16)
-    rnumels = {key: max(16, val) for key, val in rnumels.items()}
-    cfg = _get_config({"x": x, "y": x, **rnumels})
+    cfg = _get_config({"x": x, **rnumels})
     check_max_block(cfg)
-    check_config(cfg, xnumel=size_hints["x"], ynumel=size_hints["y"])
-    #cfg = _get_config({"x": x, **rnumels})
-    #check_max_block(cfg)
-    #check_config(cfg, xnumel=size_hints["x"])
+    check_config(cfg, xnumel=size_hints["x"])
     return Config(cfg, num_warps=num_warps, num_stages=num_stages)
 
 
@@ -1799,9 +1793,11 @@ def pointwise(
         filename=filename,
     )
 
-# Warning : num_stages > 1 compilation fails with current triton compiler.
+# Warning : num_stages > 1 compilation fails with 3d shaped load + tl.dot.
+# TODO: Once Triton compiler fixes this issue, we can investigate num_stages>1
+# which will probably increase performance significantly.
 # https://github.com/triton-lang/triton/issues/5882
-triton_dot_reduction_configs = [  
+triton_dot_reduction_mm_configs = [  
     Config({'XBLOCK': 32, 'YBLOCK': 32, 'R0_BLOCK': 16}, num_warps=2, num_stages=1),
     Config({'XBLOCK': 32, 'YBLOCK': 32, 'R0_BLOCK': 128}, num_warps=4, num_stages=1),
     Config({'XBLOCK': 32, 'YBLOCK': 64, 'R0_BLOCK': 32}, num_warps=8, num_stages=1),
@@ -1821,6 +1817,32 @@ triton_dot_reduction_configs = [
     Config({'XBLOCK': 128, 'YBLOCK': 128, 'R0_BLOCK': 32}, num_warps=4, num_stages=1),
     Config({'XBLOCK': 128, 'YBLOCK': 128, 'R0_BLOCK': 64}, num_warps=4, num_stages=1),
     Config({'XBLOCK': 128, 'YBLOCK': 128, 'R0_BLOCK': 64}, num_warps=8, num_stages=1),
+]
+
+# Note that we should never split the ZBLOCK (Batch dimension),
+# the 3d shape tl.dot is somehow slower than 2d tl.dot, so we force 
+# to invoke tl.dot with 2d shape. Reduction implementation for tl.dot 
+# in codegen/triton.py also assumes ZBLOCK is fixed to 1 .
+triton_dot_reduction_bmm_configs = [  
+    Config({'ZBLOCK': 1, 'XBLOCK': 32, 'YBLOCK': 32, 'R0_BLOCK': 16}, num_warps=2, num_stages=1),
+    Config({'ZBLOCK': 1, 'XBLOCK': 32, 'YBLOCK': 32, 'R0_BLOCK': 128}, num_warps=4, num_stages=1),
+    Config({'ZBLOCK': 1, 'XBLOCK': 32, 'YBLOCK': 64, 'R0_BLOCK': 32}, num_warps=8, num_stages=1),
+    Config({'ZBLOCK': 1, 'XBLOCK': 64, 'YBLOCK': 32, 'R0_BLOCK': 32}, num_warps=8, num_stages=1),
+    Config({'ZBLOCK': 1, 'XBLOCK': 64, 'YBLOCK': 32, 'R0_BLOCK': 128}, num_warps=4, num_stages=1),
+    Config({'ZBLOCK': 1, 'XBLOCK': 64, 'YBLOCK': 64, 'R0_BLOCK': 16}, num_warps=4, num_stages=1),
+    Config({'ZBLOCK': 1, 'XBLOCK': 64, 'YBLOCK': 64, 'R0_BLOCK': 32}, num_warps=4, num_stages=1),
+    Config({'ZBLOCK': 1, 'XBLOCK': 64, 'YBLOCK': 64, 'R0_BLOCK': 64}, num_warps=8, num_stages=1),
+    Config({'ZBLOCK': 1, 'XBLOCK': 64, 'YBLOCK': 64, 'R0_BLOCK': 128}, num_warps=4, num_stages=1),
+    Config({'ZBLOCK': 1, 'XBLOCK': 64, 'YBLOCK': 128, 'R0_BLOCK': 32}, num_warps=4, num_stages=1),
+    Config({'ZBLOCK': 1, 'XBLOCK': 64, 'YBLOCK': 128, 'R0_BLOCK': 32}, num_warps=8, num_stages=1),
+    Config({'ZBLOCK': 1, 'XBLOCK': 64, 'YBLOCK': 128, 'R0_BLOCK': 64}, num_warps=4, num_stages=1),
+    Config({'ZBLOCK': 1, 'XBLOCK': 64, 'YBLOCK': 128, 'R0_BLOCK': 128}, num_warps=4, num_stages=1),
+    Config({'ZBLOCK': 1,'XBLOCK': 128, 'YBLOCK': 64, 'R0_BLOCK': 32}, num_warps=4, num_stages=1),
+    Config({'ZBLOCK': 1,'XBLOCK': 128, 'YBLOCK': 64, 'R0_BLOCK': 32}, num_warps=8, num_stages=1),
+    Config({'ZBLOCK': 1,'XBLOCK': 128, 'YBLOCK': 128, 'R0_BLOCK': 32}, num_warps=8, num_stages=1),
+    Config({'ZBLOCK': 1,'XBLOCK': 128, 'YBLOCK': 128, 'R0_BLOCK': 32}, num_warps=4, num_stages=1),
+    Config({'ZBLOCK': 1,'XBLOCK': 128, 'YBLOCK': 128, 'R0_BLOCK': 64}, num_warps=4, num_stages=1),
+    Config({'ZBLOCK': 1,'XBLOCK': 128, 'YBLOCK': 128, 'R0_BLOCK': 64}, num_warps=8, num_stages=1),
 ]
 
 
@@ -1872,10 +1894,15 @@ def _reduction_configs(
         min(rnumel, MAX_R0_BLOCK),
         register_intensive=register_intensive,
     )
-    
+   
     if triton_meta["dot_reduction"] :
-        return triton_dot_reduction_configs
-
+        if len(size_hints) == 3 :
+            return triton_dot_reduction_mm_configs
+        elif len(size_hints) == 4:
+            return triton_dot_reduction_bmm_configs
+        else :
+            raise NotImplementedError(f"dot reduction only supports mm/bmm pattern")
+    
     if inductor_meta.get("max_autotune") or inductor_meta.get("max_autotune_pointwise"):
         pass  # skip all these cases
     elif reduction_hint == ReductionHint.INNER:
