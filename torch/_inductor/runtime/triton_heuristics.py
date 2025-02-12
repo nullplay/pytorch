@@ -1819,6 +1819,22 @@ triton_dot_reduction_mm_configs = [
     Config({'XBLOCK': 128, 'YBLOCK': 128, 'R0_BLOCK': 64}, num_warps=8, num_stages=1),
 ]
 
+triton_dot_persistent_reduction_mm_configs = [  
+    Config({'XBLOCK': 32, 'YBLOCK': 32}, num_warps=2, num_stages=1),
+    Config({'XBLOCK': 32, 'YBLOCK': 32}, num_warps=4, num_stages=1),
+    Config({'XBLOCK': 32, 'YBLOCK': 64}, num_warps=8, num_stages=1),
+    Config({'XBLOCK': 64, 'YBLOCK': 32}, num_warps=8, num_stages=1),
+    Config({'XBLOCK': 64, 'YBLOCK': 32}, num_warps=4, num_stages=1),
+    Config({'XBLOCK': 64, 'YBLOCK': 64}, num_warps=4, num_stages=1),
+    Config({'XBLOCK': 64, 'YBLOCK': 64}, num_warps=8, num_stages=1),
+    Config({'XBLOCK': 64, 'YBLOCK': 128}, num_warps=4, num_stages=1),
+    Config({'XBLOCK': 64, 'YBLOCK': 128}, num_warps=8, num_stages=1),
+    Config({'XBLOCK': 128, 'YBLOCK': 64}, num_warps=4, num_stages=1),
+    Config({'XBLOCK': 128, 'YBLOCK': 64}, num_warps=8, num_stages=1),
+    Config({'XBLOCK': 128, 'YBLOCK': 128}, num_warps=8, num_stages=1),
+    Config({'XBLOCK': 128, 'YBLOCK': 128}, num_warps=4, num_stages=1),
+]
+
 # Note that we should never split the ZBLOCK (Batch dimension),
 # the 3d shape tl.dot is somehow slower than 2d tl.dot, so we force 
 # to invoke tl.dot with 2d shape. Reduction implementation for tl.dot 
@@ -1845,6 +1861,21 @@ triton_dot_reduction_bmm_configs = [
     Config({'ZBLOCK': 1,'XBLOCK': 128, 'YBLOCK': 128, 'R0_BLOCK': 64}, num_warps=8, num_stages=1),
 ]
 
+triton_dot_persistent_reduction_bmm_configs = [  
+    Config({'ZBLOCK': 1, 'XBLOCK': 32, 'YBLOCK': 16}, num_warps=2, num_stages=1),
+    Config({'ZBLOCK': 1, 'XBLOCK': 32, 'YBLOCK': 16}, num_warps=4, num_stages=1),
+    Config({'ZBLOCK': 1, 'XBLOCK': 32, 'YBLOCK': 16}, num_warps=8, num_stages=1),
+    Config({'ZBLOCK': 1, 'XBLOCK': 64, 'YBLOCK': 16}, num_warps=8, num_stages=1),
+    Config({'ZBLOCK': 1, 'XBLOCK': 64, 'YBLOCK': 16}, num_warps=4, num_stages=1),
+    Config({'ZBLOCK': 1, 'XBLOCK': 64, 'YBLOCK': 16}, num_warps=4, num_stages=1),
+    Config({'ZBLOCK': 1, 'XBLOCK': 64, 'YBLOCK': 16}, num_warps=8, num_stages=1),
+    Config({'ZBLOCK': 1, 'XBLOCK': 64, 'YBLOCK': 16}, num_warps=4, num_stages=1),
+    Config({'ZBLOCK': 1, 'XBLOCK': 64, 'YBLOCK': 16}, num_warps=8, num_stages=1),
+    Config({'ZBLOCK': 1, 'XBLOCK': 128, 'YBLOCK': 16}, num_warps=4, num_stages=1),
+    Config({'ZBLOCK': 1, 'XBLOCK': 128, 'YBLOCK': 16}, num_warps=8, num_stages=1),
+    Config({'ZBLOCK': 1, 'XBLOCK': 128, 'YBLOCK': 16}, num_warps=8, num_stages=1),
+    Config({'ZBLOCK': 1, 'XBLOCK': 128, 'YBLOCK': 16}, num_warps=4, num_stages=1),
+]
 
 def _reduction_configs(
     *, 
@@ -2008,6 +2039,7 @@ def _persistent_reduction_configs(
     size_hints,
     reduction_hint=False,
     inductor_meta=None,
+    triton_meta=None
 ):
     xnumel = size_hints["x"]
     rnumel = get_total_reduction_numel(size_hints)
@@ -2040,6 +2072,14 @@ def _persistent_reduction_configs(
     if disable_pointwise_autotuning(inductor_meta):
         configs = configs[:1]
 
+    if triton_meta["dot_reduction"] :
+        if len(size_hints) == 3 :
+            return triton_dot_persistent_reduction_mm_configs
+        elif len(size_hints) == 4:
+            return triton_dot_persistent_reduction_bmm_configs
+        else :
+            raise NotImplementedError(f"dot reduction only supports mm/bmm pattern")
+
     return configs
 
 
@@ -2055,7 +2095,12 @@ def persistent_reduction(
     if inductor_meta.get("no_x_dim"):
         size_hints["x"] = 1
 
-    configs = _persistent_reduction_configs(size_hints, reduction_hint, inductor_meta)
+    configs = _persistent_reduction_configs(
+        size_hints, 
+        reduction_hint, 
+        inductor_meta,
+        triton_meta
+    )
 
     return cached_autotune(
         size_hints,

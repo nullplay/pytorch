@@ -2551,6 +2551,11 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             masked_value: Union[CSEVariable, Sequence[CSEVariable]]
             if isinstance(value, tuple):
                 masked_value = [_mask_value(v, d) for v, d in zip(value, default)]
+            # We don't need where condition in dot reduction.
+            elif reduction_type == "dot":
+                masked_value = self.cse.generate(
+                    self.compute, value, dtype=value.dtype
+                )
             else:
                 masked_value = _mask_value(value, default)
 
