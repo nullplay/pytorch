@@ -1018,7 +1018,7 @@ class TritonOverrides(OpOverrides):
 
             a_transposed = f"tl.trans({a_squeezed})" #(R,Y)
 
-            return f"tl.dot({b_squeezed}, {a_transposed})" #(X,Y)
+            return f"tl.dot({b_squeezed}, {a_transposed}, allow_tf32=True)" #(X,Y)
 
         # bmm case
         elif len(dense_sizes) == 4 :
@@ -1035,7 +1035,7 @@ class TritonOverrides(OpOverrides):
             
             a_transposed = f"tl.trans({a_squeezed})" #(R,Y)
 
-            return f"tl.dot({b_squeezed}, {a_transposed})" #(X,Y)
+            return f"tl.dot({b_squeezed}, {a_transposed}, allow_tf32=True)" #(X,Y)
 
         else :
             raise NotImplementedError("tl.dot can only do mm and bmm") 
