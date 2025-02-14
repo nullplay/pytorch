@@ -1035,6 +1035,7 @@ class TritonOverrides(OpOverrides):
             
             a_transposed = f"tl.trans({a_squeezed})" #(R,Y)
 
+            allow_tf32 = torch.backends.cuda.matmul.allow_tf32  
             return f"tl.dot({b_squeezed}, {a_transposed}, allow_tf32={allow_tf32})" #(X,Y)
 
         else :
