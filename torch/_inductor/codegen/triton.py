@@ -2016,7 +2016,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             options = match_block_pointer()
             if options is not None:
                 return options
-
+        
         expand_str = None
         index_str = self.index_to_str(index)
         if isinstance(index, sympy.Integer):
@@ -2043,7 +2043,63 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             mask_vars.add(self._load_mask)
 
         self.filter_masks(mask_vars)
+        
 
+
+        has_x_in_index = any([symbol_is_type(var, SymT.XBLOCK) for var in index_vars])
+        has_y_in_index = any([symbol_is_type(var, SymT.YBLOCK) for var in index_vars])
+        has_z_in_index = any([symbol_is_type(var, SymT.ZBLOCK) for var in index_vars])
+        has_r_in_index = any([symbol_is_type(var, SymT.R0_INDEX) for var in index_vars])
+        
+        has_x_in_mask = any([var[0] == 'x' for var in mask_vars])
+        has_y_in_mask = any([var[0] == 'y' for var in mask_vars])
+        has_z_in_mask = any([var[0] == 'z' for var in mask_vars])
+        has_r_in_mask = any([var[0] == 'r' for var in mask_vars])
+       
+        for var in index_vars:
+            has_x = symbol_is_type(var, SymT.XBLOCK)
+            has_y = symbol_is_type(var, SymT.YBLOCK)
+            has_z = symbol_is_type(var, SymT.ZBLOCK)
+            has_r = symbol_is_type(var, SymT.R0_INDEX)
+            
+            prev_str = self.index_to_str(var)
+            if has_x :
+                new_str = prev_str + "[:,None]"
+            elif has_y :
+                new_str = prev_str + "[None,:]"
+            elif has_z or has_r :
+                new_str = prev_str
+            else :
+                new_str = prev_str
+                #assert False
+            index_str = index_str.replace(prev_str, new_str)
+        
+        #breakpoint()       
+
+        new_mask_vars = []
+        for var in mask_vars:
+            has_x = var[0] == 'x' 
+            has_y = var[0] == 'y' 
+            has_z = var[0] == 'z' 
+            has_r = var[0] == 'r' 
+            breakpoint() 
+            if has_x :
+                new_mask_var = var + "[:,None]"
+            elif has_y :
+                new_mask_var = var + "[None,:]"
+            elif has_z or has_r :
+                new_mask_var = var
+            else :
+                #assert False
+                new_mask_var = var
+            new_mask_vars.append(new_mask_var)
+        mask_vars = OrderedSet(new_mask_vars)
+
+        #print(index)
+        #print(index_str)
+        print(mask_vars)
+        #print(expand_str)
+ 
         return IndexingOptions(index_str, mask_vars, expand_str, has_rindex, index)
 
     def codegen_block_ptr(
