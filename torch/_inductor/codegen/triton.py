@@ -1004,7 +1004,6 @@ class TritonOverrides(OpOverrides):
     @staticmethod
     def dot(a, b):
         dense_sizes = V.kernel.dense_size_list()
-        
         # mm case
         if len(dense_sizes) == 3:
             X = dense_sizes[0]
@@ -1018,7 +1017,8 @@ class TritonOverrides(OpOverrides):
 
             a_transposed = f"tl.trans({a_squeezed})" #(R,Y)
 
-            return f"tl.dot({b_squeezed}, {a_transposed}, allow_tf32=True)" #(X,Y)
+            allow_tf32 = torch.backends.cuda.matmul.allow_tf32  
+            return f"tl.dot({b_squeezed}, {a_transposed}, allow_tf32={allow_tf32})" #(X,Y)
 
         # bmm case
         elif len(dense_sizes) == 4 :
@@ -1035,7 +1035,7 @@ class TritonOverrides(OpOverrides):
             
             a_transposed = f"tl.trans({a_squeezed})" #(R,Y)
 
-            return f"tl.dot({b_squeezed}, {a_transposed}, allow_tf32=True)" #(X,Y)
+            return f"tl.dot({b_squeezed}, {a_transposed}, allow_tf32={allow_tf32})" #(X,Y)
 
         else :
             raise NotImplementedError("tl.dot can only do mm and bmm") 
