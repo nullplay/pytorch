@@ -222,6 +222,19 @@ class IndexingOptions:
 
     def has_rmask(self) -> bool:
         return any(str(mask).startswith("r") for mask in self.mask_vars)
+    
+    def get_depend_indices(self) -> OrderedSet:
+        index = V.kernel.prepare_indexing(self.index)
+        index_vars = index.free_symbols
+       
+        depend_indices = OrderedSet([])
+        for var in index_vars:
+            for symt in TritonSymbols.block_types:
+                if symbol_is_type(var, symt):
+                    depend_indices.add(f"{prefix_str[symt]}")
+                    break
+        
+        return depend_indices 
 
     @property
     def mask_str(self) -> str:
@@ -739,6 +752,7 @@ class TritonCSEVariable(CSEVariable):
         super().__init__(name, bounds, dtype)
         # We'll use this to track which masks the variable needs when used for indirect indexing
         self.mask_vars = OrderedSet[str]()
+        self.depend_indices = OrderedSet[str]()
         assert dtype is not None, "TritonCSEVariable must have dtype"
 
     def update_on_args(self, name, args, kwargs):
@@ -752,7 +766,14 @@ class TritonCSEVariable(CSEVariable):
                 for symt in TritonSymbols.block_types:
                     if symbol_is_type(arg, symt):
                         self.mask_vars.update([f"{prefix_str[symt]}mask"])
+                        self.depend_indices.add(f"{prefix_str[symt]}")
                         break
+
+                if symbol_is_type(arg, SymT.TMP):
+                    cse_var = self.cse.varname_map[var.name]
+                    new_deps = self.depend_indices.union(cse_var.depend_indices)
+                    self.depend_indices = new_deps
+
 
 
 def maybe_upcast_float32(convert_output: bool = True) -> Callable[[_T], _T]:
@@ -1375,8 +1396,8 @@ class TritonKernelOverrides(TritonOverrides):
                     cls.to_dtype(var, index_dtype),
                     dtype=index_dtype,
                 )
-
         var.mask_vars = indexing.mask_vars
+        var.depend_indices = indexing.get_depend_indices()
         return var
 
     @staticmethod
@@ -1417,7 +1438,7 @@ class TritonKernelOverrides(TritonOverrides):
         else:
             ret = result
 
-        ret.mask_vars.discard(new_mask)
+        ret.mask_vars.discard(new_mask) #maskupd1
         return ret
 
     @staticmethod
@@ -1589,6 +1610,12 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             SymT, dict[str, list[sympy.Expr]]
         ] = collections.defaultdict(dict)
         self._load_counts: collections.Counter[str] = collections.Counter()
+
+        self.is_dot_reduction = False
+        for node in self.features.node_schedule:
+            if isinstance(node, SchedulerNode):
+                has_dot = node.node.get_reduction_type() == "dot"
+                self.is_dot_reduction |= has_dot
 
         # A set of autotuning hints to pass as part of triton_meta
         self.autotune_hints = OrderedSet[AutotuneHint]()
@@ -1988,12 +2015,17 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             options = match_block_pointer()
             if options is not None:
                 return options
-        
+       
+
         expand_str = None
         index_str = self.index_to_str(index)
         if isinstance(index, sympy.Integer):
             expand_str = f"{copy_shape}.shape" if copy_shape else self.dense_size_str()
-            index_str = f"tl.full({expand_str}, {index_str}, tl.int32)"
+            if self.current_node is not None and self.is_dot_reduction :
+                index_str = f"{index_str}"
+            else :
+                index_str = f"tl.full({expand_str}, {index_str}, tl.int32)"
+
             if self.fixed_config and not self._has_constant_xmask():
                 mask_vars = OrderedSet(["xmask"])
             else:
@@ -2018,32 +2050,51 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         
        
         if self.current_node is not None :
-            node = self.current_node.node
-            if node.get_reduction_type() == "dot" :
-                has_x_index = any([symbol_is_type(var, SymT.XBLOCK) for var in index_vars])
-                has_y_index = any([symbol_is_type(var, SymT.YBLOCK) for var in index_vars])
+            if self.is_dot_reduction and self.inside_reduction :
+                def is_dependent(var:sympy.Symbol, sym:SymT) :
+                    result = False
+                    result |= symbol_is_type(var, sym)
+                    if symbol_is_type(var, SymT.TMP):
+                        cse_var = self.cse.varname_map[var.name]
+                        result |= prefix_str[sym] in cse_var.depend_indices
+                    return result
 
-                r_index_vars = [var for var in index_vars if symbol_is_type(var, SymT.R0_INDEX)]
-                r_mask_vars = [var for var in mask_vars if var[0] == 'r']
-                
+                dep_xindex = False
+                dep_yindex = False
+                dep_rindex = has_rindex
+                for var in index_vars:
+                    dep_xindex |= is_dependent(var, SymT.XBLOCK)
+                    dep_yindex |= is_dependent(var, SymT.YBLOCK)  
+                    dep_rindex |= is_dependent(var, SymT.R0_INDEX)
+
                 assert not (
-                    has_x_index 
-                    and has_y_index 
-                    and r_index_vars
+                    dep_xindex 
+                    and dep_yindex 
+                    and dep_rindex 
                 ), "dot reduction cannot handle indexing where all x,y,r exists"
-     
+ 
                 r_suffix = ""
-                if has_x_index and not has_y_index :
+                if dep_xindex and not dep_yindex :
                     r_suffix = "[None,:]"
-                elif has_y_index and not has_x_index :
+                elif dep_yindex and not dep_xindex :
                     r_suffix = "[:,None]"              
-                
+               
+                r_index_vars = [
+                    var 
+                    for var in index_vars 
+                    if (
+                        is_dependent(var, SymT.R0_INDEX)
+                        and not is_dependent(var, SymT.XBLOCK)
+                        and not is_dependent(var, SymT.YBLOCK)
+                    )
+                ]
                 for rvar in r_index_vars:
                     prev_str = self.index_to_str(rvar)
                     new_str = prev_str + r_suffix
                     index_str = index_str.replace(prev_str, new_str)
          
                 new_mask_vars = []
+                r_mask_vars = [var for var in mask_vars if var[0] == 'r']
                 for rvar in r_mask_vars:
                     new_mask_vars.append(rvar + r_suffix) 
                 mask_vars = OrderedSet(new_mask_vars)
@@ -2121,7 +2172,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         index_str = indexing.index_str
         mask_str = indexing.mask_str if indexing.has_mask() else None
         size_str = texpr(self.rename_indexing(size)) if upper else None
-
+        #breakpoint()
         # expr is already wrapped
         line = self.indirect_assert(
             index_str, "0" if lower else None, size_str, mask_str
@@ -2259,6 +2310,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             load_counts[name] -= 1  # don't double count cache hit
         assert isinstance(result_var, TritonCSEVariable)
         result_var.mask_vars = indexing.mask_vars  # type: ignore[assignment]
+        result_var.depend_indices = indexing.get_depend_indices() 
 
         if append_broadcast:
             line = f"tl.broadcast_to({result_var}, {append_broadcast})"
@@ -2274,7 +2326,10 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
     ) -> None:
         var = self.args.output(name)
         original_index = index
-        indexing = self.indexing(index, dense_indexing=True, block_ptr=mode is None)
+        if self.is_dot_reduction:
+            indexing = self.indexing(index, dense_indexing=False, block_ptr=mode is None)
+        else :
+            indexing = self.indexing(index, dense_indexing=True, block_ptr=mode is None)
 
         # Guard against write-after-read corruption in triton.
         # See # https://github.com/openai/triton/issues/1615
@@ -3548,7 +3603,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             "signature": triton_meta_signature,
             "device": DeviceProperties.create(V.graph.get_current_device_or_throw()),
             "constants": {},
-            "dot_reduction": "tl.dot" in str(self.body) or "tl.dot" in str(self.compute),
+            "dot_reduction": self.is_dot_reduction,
         }
 
         # Skip memory optimization for forward of the training loop where we expect
