@@ -759,6 +759,7 @@ class TritonCSEVariable(CSEVariable):
         for arg in args:
             if isinstance(arg, TritonCSEVariable):
                 self.mask_vars.update(arg.mask_vars)
+                self.depend_indices.update(arg.depend_indices)
             elif isinstance(arg, sympy.Symbol):
                 # most of the time index vars don't need masks associated with them
                 # however, when index vars are used to compute indices for indirect reads
@@ -768,11 +769,6 @@ class TritonCSEVariable(CSEVariable):
                         self.mask_vars.update([f"{prefix_str[symt]}mask"])
                         self.depend_indices.add(f"{prefix_str[symt]}")
                         break
-
-                if symbol_is_type(arg, SymT.TMP):
-                    cse_var = self.cse.varname_map[var.name]
-                    new_deps = self.depend_indices.union(cse_var.depend_indices)
-                    self.depend_indices = new_deps
 
 
 
@@ -2093,10 +2089,12 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                     new_str = prev_str + r_suffix
                     index_str = index_str.replace(prev_str, new_str)
          
-                new_mask_vars = []
-                r_mask_vars = [var for var in mask_vars if var[0] == 'r']
-                for rvar in r_mask_vars:
-                    new_mask_vars.append(rvar + r_suffix) 
+                new_mask_vars = [] 
+                for rvar in mask_vars:
+                    if rvar[0] == "r":
+                        new_mask_vars.append(rvar + r_suffix) 
+                    else :
+                        new_mask_vars.append(rvar) 
                 mask_vars = OrderedSet(new_mask_vars)
 
         return IndexingOptions(index_str, mask_vars, expand_str, has_rindex, index)

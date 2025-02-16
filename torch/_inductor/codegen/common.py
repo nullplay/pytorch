@@ -2387,7 +2387,7 @@ class CSEProxy(DefaultHandler):
 
         if var.bounds.lower < 0:  # type: ignore[operator]
             if wrap_neg:
-                breakpoint()
+              #breakpoint()
                 stm = ops.add(var, ops.index_expr(size, torch.long))
                 # Mixed negative and non-negative
                 if var.bounds.upper >= 0:  # type: ignore[operator]
