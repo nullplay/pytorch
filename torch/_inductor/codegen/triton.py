@@ -756,10 +756,23 @@ class TritonCSEVariable(CSEVariable):
         assert dtype is not None, "TritonCSEVariable must have dtype"
 
     def update_on_args(self, name, args, kwargs):
+        dep_x = False
+        dep_y = False
+        dep_r = False
+        only_dep_r_args = []
         for arg in args:
             if isinstance(arg, TritonCSEVariable):
                 self.mask_vars.update(arg.mask_vars)
                 self.depend_indices.update(arg.depend_indices)
+                
+                dep_x_arg = prefix_str[SymT.XBLOCK] in arg.depend_indices
+                dep_y_arg = prefix_str[SymT.YBLOCK] in arg.depend_indices
+                dep_r_arg = prefix_str[SymT.R0_INDEX] in arg.depend_indices
+                if dep_r_arg and not dep_x_arg and not dep_y_arg:
+                    only_dep_r_args.append(arg)
+                dep_x |= dep_x_arg
+                dep_y |= dep_y_arg
+                dep_r |= dep_r_arg
             elif isinstance(arg, sympy.Symbol):
                 # most of the time index vars don't need masks associated with them
                 # however, when index vars are used to compute indices for indirect reads
@@ -769,7 +782,48 @@ class TritonCSEVariable(CSEVariable):
                         self.mask_vars.update([f"{prefix_str[symt]}mask"])
                         self.depend_indices.add(f"{prefix_str[symt]}")
                         break
+        
+        # This code handles when we didn't properly suffix the r-only related variable
+        # because the operation was not overrided by the codegen/triton, but go through
+        # codegen/common.py. For example,
+        # tmp2 = r
+        # tmp1 = x
+        # tmp3 = tmp1 * tmp2
+        # 
+        # We can see that tmp3 is depending on x and r so the correct indexing would be
+        # adding suffix [None,:] to tmp2 tmp3 = tmp1 * tmp2[None,:].
+        # We handle this by hooking when cse.update_on_args is called.
+        # Since when cse.update_on_args got called, we already generated the code into 
+        # triton kernel and V.kernel.cse._cache, we modify the cse._cache and triton kernel
+        r_suffix = ""
+        if dep_x :
+            r_suffix = "[None,:]"
+        elif dep_y :
+            r_suffix = "[:,None]"
+       
+        cached_codes = list(V.kernel.cse._cache.keys())
+        cached_csevar = list(V.kernel.cse._cache.values())
+        already_written_code = f"{self.name} = {cached_codes[cached_csevar.index(self)]}"
+        assert not (only_dep_r_args and dep_x and dep_y), "x,y,r all cannot depend for same var"
+        if only_dep_r_args and (dep_x or dep_y) :
+            assert V.kernel.cse.contains(f"{cached_codes[cached_csevar.index(self)]}")
+        for rarg in only_dep_r_args :
+            assert isinstance(rarg, TritonCSEVariable)
+            prev_name = rarg.name
+            new_name = prev_name + r_suffix
+            new_written_code = already_written_code.replace(prev_name, new_name)
 
+            # update cse cache
+            V.kernel.cse.put(new_name, new_written_code)
+            
+            # I'm not sure where did we write "already_written_code"
+            # So check compute and body (there might be more)
+            if V.kernel.compute._lines[-1] == already_written_code :
+                V.kernel.compute._lines[-1] = new_written_code
+            if V.kernel.body._lines[-1] == already_written_code :
+                V.kernel.body._lines[-1] = new_written_code
+
+        print("update_on_args : ", name, args, self.depend_indices)
 
 
 def maybe_upcast_float32(convert_output: bool = True) -> Callable[[_T], _T]:
