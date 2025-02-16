@@ -2155,7 +2155,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                     if var[0] == "r":
                         new_mask_vars.append(var + r_suffix)
                     
-                    # There are case where no xmask and ymask in the mask_vars.
+                    # There are cases where no xmask and ymask in the mask_vars.
                     # Then we need to manually broadcast to match the block dim of index
                     # For example 1)
                     # tl.load(in_ptr0 + x2 + r0[None,:], zmask & rmask)
@@ -2164,7 +2164,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                     # For example 2)
                     # tl.load(in_ptr0 + y1 + r0[:,None], zmask)
                     # -> tl.load(in_ptr0 + y1 + r0[:,None], zmask[None,:])
-                    if var[0] == "z":
+                    elif var[0] == "z":
                         if no_xy_mask and indexing_dim >= 2:
                             new_mask_vars.append(var + z_suffix)
 
