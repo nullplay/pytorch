@@ -1797,25 +1797,25 @@ def pointwise(
 # https://github.com/triton-lang/triton/issues/5882
 # when I use latest triton main (3.2.0+git56a9adfb), it works
 triton_dot_reduction_mm_configs = [  
-    Config({'XBLOCK': 32, 'YBLOCK': 32, 'R0_BLOCK': 16}, num_warps=2, num_stages=1),
+    Config({'XBLOCK': 32, 'YBLOCK': 32, 'R0_BLOCK': 16}, num_warps=2,  num_stages=1),
     Config({'XBLOCK': 32, 'YBLOCK': 32, 'R0_BLOCK': 128}, num_warps=4, num_stages=2),
-    Config({'XBLOCK': 32, 'YBLOCK': 64, 'R0_BLOCK': 32}, num_warps=8, num_stages=5),
-    Config({'XBLOCK': 64, 'YBLOCK': 32, 'R0_BLOCK': 32}, num_warps=8, num_stages=5),
+    Config({'XBLOCK': 32, 'YBLOCK': 64, 'R0_BLOCK': 32}, num_warps=8,  num_stages=5),
+    Config({'XBLOCK': 64, 'YBLOCK': 32, 'R0_BLOCK': 32}, num_warps=8,  num_stages=5),
     Config({'XBLOCK': 64, 'YBLOCK': 32, 'R0_BLOCK': 128}, num_warps=4, num_stages=5),
-    Config({'XBLOCK': 64, 'YBLOCK': 64, 'R0_BLOCK': 16}, num_warps=4, num_stages=2),
-    Config({'XBLOCK': 64, 'YBLOCK': 64, 'R0_BLOCK': 32}, num_warps=4, num_stages=2),
-    Config({'XBLOCK': 64, 'YBLOCK': 64, 'R0_BLOCK': 64}, num_warps=8, num_stages=3),
+    Config({'XBLOCK': 64, 'YBLOCK': 64, 'R0_BLOCK': 16}, num_warps=4,  num_stages=2),
+    Config({'XBLOCK': 64, 'YBLOCK': 64, 'R0_BLOCK': 32}, num_warps=4,  num_stages=2),
+    Config({'XBLOCK': 64, 'YBLOCK': 64, 'R0_BLOCK': 64}, num_warps=8,  num_stages=3),
     Config({'XBLOCK': 64, 'YBLOCK': 64, 'R0_BLOCK': 128}, num_warps=4, num_stages=5),
     Config({'XBLOCK': 64, 'YBLOCK': 128, 'R0_BLOCK': 32}, num_warps=4, num_stages=3),
     Config({'XBLOCK': 64, 'YBLOCK': 128, 'R0_BLOCK': 32}, num_warps=8, num_stages=4),
     Config({'XBLOCK': 64, 'YBLOCK': 128, 'R0_BLOCK': 64}, num_warps=4, num_stages=3),
-    Config({'XBLOCK': 64, 'YBLOCK': 128, 'R0_BLOCK': 128}, num_warps=4, num_stages=4),
+    Config({'XBLOCK': 64, 'YBLOCK': 128, 'R0_BLOCK': 128}, num_warps=4,num_stages=4),
     Config({'XBLOCK': 128, 'YBLOCK': 64, 'R0_BLOCK': 32}, num_warps=4, num_stages=3),
     Config({'XBLOCK': 128, 'YBLOCK': 64, 'R0_BLOCK': 32}, num_warps=8, num_stages=4),
-    Config({'XBLOCK': 128, 'YBLOCK': 128, 'R0_BLOCK': 32}, num_warps=8, num_stages=2),
-    Config({'XBLOCK': 128, 'YBLOCK': 128, 'R0_BLOCK': 32}, num_warps=4, num_stages=3),
-    Config({'XBLOCK': 128, 'YBLOCK': 128, 'R0_BLOCK': 64}, num_warps=4, num_stages=3),
-    Config({'XBLOCK': 128, 'YBLOCK': 128, 'R0_BLOCK': 64}, num_warps=8, num_stages=5),
+    Config({'XBLOCK': 128, 'YBLOCK': 128, 'R0_BLOCK': 32}, num_warps=8,num_stages=2),
+    Config({'XBLOCK': 128, 'YBLOCK': 128, 'R0_BLOCK': 32}, num_warps=4,num_stages=3),
+    Config({'XBLOCK': 128, 'YBLOCK': 128, 'R0_BLOCK': 64}, num_warps=4,num_stages=3),
+    Config({'XBLOCK': 128, 'YBLOCK': 128, 'R0_BLOCK': 64}, num_warps=8,num_stages=5),
 ]
 
 triton_dot_persistent_reduction_mm_configs = [  

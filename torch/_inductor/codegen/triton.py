@@ -1003,40 +1003,12 @@ class TritonOverrides(OpOverrides):
 
     @staticmethod
     def dot(a, b):
-        dense_sizes = V.kernel.dense_size_list()
-        # mm case
-        if len(dense_sizes) == 3:
-            X = dense_sizes[0]
-            Y = dense_sizes[1]
-            R = dense_sizes[2]
-
-            # a = (1,YBLOCK,RBLOCK)
-            # b = (XBLOCK,1,RBLOCK)
-            a_squeezed = triton_reshape(str(a), [1,Y,R], [Y,R]) # (Y,R)
-            b_squeezed = triton_reshape(str(b), [X,1,R], [X,R]) # (X,R)
-
-            a_transposed = f"tl.trans({a_squeezed})" #(R,Y)
-
+        len_dense_sizes = len(V.kernel.dense_size_list())
+        # mm : len_dense_sizes = 3  
+        # bmm : len_dense_sizes = 4
+        if len_dense_sizes == 3 or len_dense_sizes == 4:
             allow_tf32 = torch.backends.cuda.matmul.allow_tf32  
-            return f"tl.dot({b_squeezed}, {a_transposed}, allow_tf32={allow_tf32})" #(X,Y)
-
-        # bmm case
-        elif len(dense_sizes) == 4 :
-            X = dense_sizes[0]
-            Y = dense_sizes[1]
-            Z = dense_sizes[2]
-            R = dense_sizes[3]
-
-            # a = (1,YBLOCK,ZBLOCK,RBLOCK)
-            # b = (XBLOCK,1,ZBLOCK,RBLOCK)
-            # Note that, autotuner config will always ensure ZBLOCK=1
-            a_squeezed = triton_reshape(str(a), [1,Y,1,R], [Y,R]) 
-            b_squeezed = triton_reshape(str(b), [X,1,1,R], [X,R]) 
-            
-            a_transposed = f"tl.trans({a_squeezed})" #(R,Y)
-
-            allow_tf32 = torch.backends.cuda.matmul.allow_tf32  
-            return f"tl.dot({b_squeezed}, {a_transposed}, allow_tf32={allow_tf32})" #(X,Y)
+            return f"tl.dot({b}, {a}, allow_tf32={allow_tf32})" #(X,Y)
 
         else :
             raise NotImplementedError("tl.dot can only do mm and bmm") 
@@ -2044,62 +2016,38 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
         self.filter_masks(mask_vars)
         
-
-
-        has_x_in_index = any([symbol_is_type(var, SymT.XBLOCK) for var in index_vars])
-        has_y_in_index = any([symbol_is_type(var, SymT.YBLOCK) for var in index_vars])
-        has_z_in_index = any([symbol_is_type(var, SymT.ZBLOCK) for var in index_vars])
-        has_r_in_index = any([symbol_is_type(var, SymT.R0_INDEX) for var in index_vars])
-        
-        has_x_in_mask = any([var[0] == 'x' for var in mask_vars])
-        has_y_in_mask = any([var[0] == 'y' for var in mask_vars])
-        has_z_in_mask = any([var[0] == 'z' for var in mask_vars])
-        has_r_in_mask = any([var[0] == 'r' for var in mask_vars])
        
-        for var in index_vars:
-            has_x = symbol_is_type(var, SymT.XBLOCK)
-            has_y = symbol_is_type(var, SymT.YBLOCK)
-            has_z = symbol_is_type(var, SymT.ZBLOCK)
-            has_r = symbol_is_type(var, SymT.R0_INDEX)
-            
-            prev_str = self.index_to_str(var)
-            if has_x :
-                new_str = prev_str + "[:,None]"
-            elif has_y :
-                new_str = prev_str + "[None,:]"
-            elif has_z or has_r :
-                new_str = prev_str
-            else :
-                new_str = prev_str
-                #assert False
-            index_str = index_str.replace(prev_str, new_str)
-        
-        #breakpoint()       
+        if self.current_node is not None :
+            node = self.current_node.node
+            if node.get_reduction_type() == "dot" :
+                has_x_index = any([symbol_is_type(var, SymT.XBLOCK) for var in index_vars])
+                has_y_index = any([symbol_is_type(var, SymT.YBLOCK) for var in index_vars])
 
-        new_mask_vars = []
-        for var in mask_vars:
-            has_x = var[0] == 'x' 
-            has_y = var[0] == 'y' 
-            has_z = var[0] == 'z' 
-            has_r = var[0] == 'r' 
-            breakpoint() 
-            if has_x :
-                new_mask_var = var + "[:,None]"
-            elif has_y :
-                new_mask_var = var + "[None,:]"
-            elif has_z or has_r :
-                new_mask_var = var
-            else :
-                #assert False
-                new_mask_var = var
-            new_mask_vars.append(new_mask_var)
-        mask_vars = OrderedSet(new_mask_vars)
+                r_index_vars = [var for var in index_vars if symbol_is_type(var, SymT.R0_INDEX)]
+                r_mask_vars = [var for var in mask_vars if var[0] == 'r']
+                
+                assert not (
+                    has_x_index 
+                    and has_y_index 
+                    and r_index_vars
+                ), "dot reduction cannot handle indexing where all x,y,r exists"
+     
+                r_suffix = ""
+                if has_x_index and not has_y_index :
+                    r_suffix = "[None,:]"
+                elif has_y_index and not has_x_index :
+                    r_suffix = "[:,None]"              
+                
+                for rvar in r_index_vars:
+                    prev_str = self.index_to_str(rvar)
+                    new_str = prev_str + r_suffix
+                    index_str = index_str.replace(prev_str, new_str)
+         
+                new_mask_vars = []
+                for rvar in r_mask_vars:
+                    new_mask_vars.append(rvar + r_suffix) 
+                mask_vars = OrderedSet(new_mask_vars)
 
-        #print(index)
-        #print(index_str)
-        print(mask_vars)
-        #print(expand_str)
- 
         return IndexingOptions(index_str, mask_vars, expand_str, has_rindex, index)
 
     def codegen_block_ptr(
@@ -2544,9 +2492,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             elif reduction_type == "dot" :
                 is_bmm = len(self.dense_size_list()) == 4
                 if is_bmm :
-                    value = f"{value}[:,:,None,None]" # (X,Y) to (X,Y,1,1)
+                    value = f"{value}" # (X,Y) to (X,Y,1,1)
                 else :
-                    value = f"{value}[:,:,None]" # (X,Y) to (X,Y,1)
+                    value = f"{value}" # (X,Y) to (X,Y,1)
             else:
                 value = self.reduction_resize(
                     f"{module}.{reduction_type}({value}, {dim})"

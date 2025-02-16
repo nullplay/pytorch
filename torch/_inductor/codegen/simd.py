@@ -512,9 +512,20 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
         return sum(int(tree.tensor_dim is not None) for tree in self.range_trees)
 
     def indexing_size_str(self, i: int) -> str:
-        sizes = ["None"] * self.triton_tensor_ndim()
-        sizes[i] = ":"
-        return f"[{', '.join(sizes)}]"
+        is_dot_reduction = self.features.node_schedule[0].node.get_reduction_type() == "dot"
+        if is_dot_reduction :
+            is_x = i == 0
+            is_y = i == 1
+            if is_x :
+                return "[:,None]"
+            elif is_y :
+                return "[None,:]"
+            else : # is_z, is_r
+                return ""
+        else :
+            sizes = ["None"] * self.triton_tensor_ndim()
+            sizes[i] = ":"
+            return f"[{', '.join(sizes)}]"
 
     def dense_size_list(self) -> list[str]:
         sizes = ["1"] * self.triton_tensor_ndim()
