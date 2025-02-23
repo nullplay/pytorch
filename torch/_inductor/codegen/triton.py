@@ -823,8 +823,6 @@ class TritonCSEVariable(CSEVariable):
             if V.kernel.body._lines[-1] == already_written_code :
                 V.kernel.body._lines[-1] = new_written_code
 
-        print("update_on_args : ", name, args, self.depend_indices)
-
 
 def maybe_upcast_float32(convert_output: bool = True) -> Callable[[_T], _T]:
     """
