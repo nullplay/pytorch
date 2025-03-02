@@ -567,7 +567,6 @@ class CachingAutotuner(KernelInterface):
         stream = device_interface.get_raw_stream(device_interface.current_device())
 
         cpu_copies = self.copy_args_to_cpu_if_needed(*args, **kwargs)
-
         def kernel_call():
             cloned_args, cloned_kwargs = self.maybe_clone_args(
                 cpu_copies, *args, **kwargs
@@ -590,7 +589,6 @@ class CachingAutotuner(KernelInterface):
 
         if self.device_props.type == "cpu":
             return benchmarker.benchmark_cpu(kernel_call)
-
         return benchmarker.benchmark_gpu(kernel_call, rep=40)
 
     def copy_args_to_cpu_if_needed(self, *args, **kwargs):
@@ -708,6 +706,7 @@ class CachingAutotuner(KernelInterface):
             # TODO(masnesral): Enable this when we figure out how to get the CompileId:
             # dynamo_compile_runtime_column_us="runtime_triton_autotune_time_us",
         ):
+            
             timings = {
                 launcher: self.bench(launcher, *args, **kwargs)
                 for launcher in self.launchers
@@ -1316,7 +1315,6 @@ def cached_autotune(
     inductor_meta = {} if inductor_meta is None else inductor_meta
 
     disabled = inductor_meta.get("force_disable_caches", False)
-
     # on disk caching logic and/or remote caching
     autotune_cache = None
     if (
@@ -1497,7 +1495,6 @@ def triton_config(
     processed by each thread. It's always enforced.
     """
     # Ideally we want to read this from some device config
-
     maxGridSize = [2147483647, 65535, 65535]
 
     target = conditional_product(x, y, z)
@@ -1749,6 +1746,14 @@ def pointwise(
                 ),
                 *hinted_configs,
             ]
+
+    # If there is a atomic_add, blocking with size 1 on large numel
+    # sometimes never stops during benchmarking (depends on data).
+    # so we increase the 1 to 8 only for dot_reduction is enabled.
+    # the better option will be do this when atomic_add is in kernel.
+    # More fundamental solution would be figure out is there a deadlock
+    # in triton kernel when there is a atomicadd.
+    s1 = 8 if torch._inductor.config.triton.use_dot_reduction else 1 
     if len(size_hints) == 2:
         if (
             disable_pointwise_autotuning(inductor_meta) or tile_hint == TileHint.SQUARE
@@ -1763,8 +1768,8 @@ def pointwise(
                 triton_config_with_settings(size_hints, 64, 64),  # ~8% better for fp16
                 triton_config_with_settings(size_hints, 256, 16),
                 triton_config_with_settings(size_hints, 16, 256),
-                triton_config_with_settings(size_hints, bs, 1),
-                triton_config_with_settings(size_hints, 1, bs),
+                triton_config_with_settings(size_hints, bs, s1),
+                triton_config_with_settings(size_hints, s1, bs),
                 *hinted_configs,
             ]
     if len(size_hints) == 3:
@@ -1776,12 +1781,12 @@ def pointwise(
                 triton_config_with_settings(size_hints, 64, 8, 8),
                 triton_config_with_settings(size_hints, 8, 64, 8),
                 triton_config_with_settings(size_hints, 8, 8, 64),
-                triton_config_with_settings(size_hints, bs, 1, 1),
-                triton_config_with_settings(size_hints, 1, bs, 1),
-                triton_config_with_settings(size_hints, 1, 1, bs),
+                triton_config_with_settings(size_hints, bs, s1, s1),
+                triton_config_with_settings(size_hints, s1, bs, s1),
+                triton_config_with_settings(size_hints, s1, s1, bs),
                 *hinted_configs,
             ]
-
+    
     if not configs:
         raise NotImplementedError(f"size_hints: {size_hints}")
     return cached_autotune(

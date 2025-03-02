@@ -238,7 +238,6 @@ class InductorBenchmarker(TritonBenchmarker):
         """
         # we don't want any outside errors propagating into benchmarking
         torch.cuda.synchronize()
-
         # warmup `_callable` (and catches any failures in the process)
         _callable()
         torch.cuda.synchronize()

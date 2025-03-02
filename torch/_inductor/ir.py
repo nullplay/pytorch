@@ -4054,6 +4054,15 @@ class ComputedBuffer(OperationBuffer):
         LoopBody,
         tuple[list[sympy.Expr], list[sympy.Expr]],
     ]:
+        
+        #if self.get_reduction_type() == "dot" :
+        #    args, var_ranges = dependencies.index_vars_no_squeeze(
+        #        self.data.get_pointwise_size(), self.data.get_reduction_size(), prefix="q"
+        #    )
+        #    for key in var_ranges:
+        #        if var_ranges[key] == 1:
+        #            var_ranges[key] = sympy.Symbol("sOne")
+        #else:
         args, var_ranges = dependencies.index_vars_squeeze(
             self.data.get_pointwise_size(), self.data.get_reduction_size(), prefix="q"
         )
@@ -4106,7 +4115,7 @@ class ComputedBuffer(OperationBuffer):
             body,
             (index_vars, reduce_vars),
         ) = self.get_default_sizes_body()
-
+         
         if recompute_sizes_body_func:
             (
                 (index_size, reduce_size),
@@ -4148,12 +4157,11 @@ class ComputedBuffer(OperationBuffer):
             )
             # for NHWC: reindex0([0,1,2,3]) = [0,2,3,1], reindex1([0,1,2,3]) = [0,3,2,1]
             x_vars = reindex0(x_vars)
-
             if simplify_loops:
                 sizes, reindex2, _prune = V.graph.sizevars._simplify_loops(
                     x_vars,
                     sizes,
-                    index_prevent_reordering(index_formulas, x_vars, sizes),
+                    index_prevent_reordering(index_formulas, x_vars, sizes)
                 )
                 reindex = fuse_reindexing(reindex1, reindex2)
             else:
@@ -4170,7 +4178,6 @@ class ComputedBuffer(OperationBuffer):
             index_size,
             should_merge_loops,
         )
-
         # Like iteration dimensions, we may also want to delay merging reduction dimensions.
         # E.g., if we reduce a tensor [M, N, K] for its M and N dimensions followed by a pointwise
         # kernel, merging M and N dimension too early makes it hard to decide what loop order
@@ -4178,7 +4185,7 @@ class ComputedBuffer(OperationBuffer):
         reduce_ranges, reduce_reindex, _ = simplify_and_reorder(
             reduce_vars, support_vars, reduce_size, should_merge_loops
         )
-
+        
         # retrace the loop body with simplification and reordering applied
         (iter_vars, reduce_vars), var_ranges = dependencies.index_vars_no_squeeze(
             iter_ranges,
@@ -4192,6 +4199,16 @@ class ComputedBuffer(OperationBuffer):
             iter_vars,
             reduce_vars,
         )
+        
+        if self.get_reduction_type() == "dot" :
+            for i, _ in enumerate(iter_ranges):
+                if iter_ranges[i] == sympy.Symbol("sOne"):
+                    iter_ranges[i] = 1 
+            
+            for key in body.var_ranges:
+                if body.var_ranges[key] == sympy.Symbol("sOne"):
+                    body.var_ranges[key] = 1 
+
         return (iter_ranges, reduce_ranges), body
 
     @staticmethod

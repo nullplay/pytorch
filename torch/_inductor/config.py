@@ -1101,6 +1101,9 @@ class triton:
     # Generate code containing the newer tl.make_block_ptr() API for loads/store
     use_block_ptr = False
 
+    # Generate code that uses tl.dot when mm/bmm pattern is detected instead of template.
+    use_dot_reduction = False 
+
     # Inject a bug into our relu implementation; useful for testing our repro
     # extraction and minification functionality.
     # Valid values: "compile_error", "runtime_error", "accuracy"

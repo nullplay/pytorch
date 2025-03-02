@@ -788,18 +788,18 @@ class TritonCSEVariable(CSEVariable):
         # codegen/common.py. For example,
         # tmp2 = r
         # tmp1 = x
-        # tmp3 = tmp1 * tmp2
+        # tmp3 = tmp1 * tmp2 #(r,x)
         # 
         # We can see that tmp3 is depending on x and r so the correct indexing would be
-        # adding suffix [None,:] to tmp2 tmp3 = tmp1 * tmp2[None,:].
+        # adding suffix [:,None] to tmp2 tmp3 = tmp1 * tmp2[:,None].
         # We handle this by hooking when cse.update_on_args is called.
         # Since when cse.update_on_args got called, we already generated the code into 
         # triton kernel and V.kernel.cse._cache, we modify the cse._cache and triton kernel
         r_suffix = ""
         if dep_x :
-            r_suffix = "[None,:]"
-        elif dep_y :
             r_suffix = "[:,None]"
+        elif dep_y :
+            r_suffix = "[None,:]"
        
         cached_codes = list(V.kernel.cse._cache.keys())
         cached_csevar = list(V.kernel.cse._cache.values())
@@ -1077,7 +1077,7 @@ class TritonOverrides(OpOverrides):
         # bmm : len_dense_sizes = 4
         if len_dense_sizes == 3 or len_dense_sizes == 4:
             allow_tf32 = torch.backends.cuda.matmul.allow_tf32  
-            return f"tl.dot({b}, {a}, allow_tf32={allow_tf32})" #(X,Y)
+            return f"tl.dot({a}, {b}, allow_tf32={allow_tf32})" #(Y,X)
 
         else :
             raise NotImplementedError("tl.dot can only do mm and bmm") 
@@ -1659,12 +1659,6 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         ] = collections.defaultdict(dict)
         self._load_counts: collections.Counter[str] = collections.Counter()
 
-        self.is_dot_reduction = False
-        for node in self.features.node_schedule:
-            if isinstance(node, SchedulerNode):
-                has_dot = node.node.get_reduction_type() == "dot"
-                self.is_dot_reduction |= has_dot
-
         # A set of autotuning hints to pass as part of triton_meta
         self.autotune_hints = OrderedSet[AutotuneHint]()
         self.triton_meta: Optional[dict[str, Any]] = None
@@ -2114,7 +2108,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                     dep_xindex |= is_dependent(var, SymT.XBLOCK)
                     dep_yindex |= is_dependent(var, SymT.YBLOCK)  
                     dep_rindex |= is_dependent(var, SymT.R0_INDEX)
-
+                
                 assert not (
                     dep_xindex 
                     and dep_yindex 
@@ -2124,11 +2118,11 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 r_suffix = ""
                 z_suffix = "" #only for mask
                 if dep_xindex and not dep_yindex :
-                    r_suffix = "[None,:]"
-                    z_suffix = "[:,None]"
-                elif dep_yindex and not dep_xindex :
-                    r_suffix = "[:,None]"              
+                    r_suffix = "[:,None]"
                     z_suffix = "[None,:]"
+                elif dep_yindex and not dep_xindex :
+                    r_suffix = "[None,:]"              
+                    z_suffix = "[:,None]"
                
                 r_index_vars = [
                     var 
@@ -2156,12 +2150,12 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                     # There are cases where no xmask and ymask in the mask_vars.
                     # Then we need to manually broadcast to match the block dim of index
                     # For example 1)
-                    # tl.load(in_ptr0 + x2 + r0[None,:], zmask & rmask)
-                    # -> tl.load(in_ptr0 + x2 + r0[None,:], zmask[:,None] & rmask[None,:])
+                    # tl.load(in_ptr0 + x2 + r0[:,None], zmask & rmask)
+                    # -> tl.load(in_ptr0 + x2 + r0[:,None], zmask[None,:] & rmask[:,None])
                     #
                     # For example 2)
-                    # tl.load(in_ptr0 + y1 + r0[:,None], zmask)
-                    # -> tl.load(in_ptr0 + y1 + r0[:,None], zmask[None,:])
+                    # tl.load(in_ptr0 + y1 + r0[None,:], zmask)
+                    # -> tl.load(in_ptr0 + y1 + r0[None,:], zmask[:,None])
                     elif var[0] == "z":
                         if no_xy_mask and indexing_dim >= 2:
                             new_mask_vars.append(var + z_suffix)
@@ -2572,18 +2566,16 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         # we don't want to keep the R0_BLOCK/R1_BLOCK in the accumulator.
         # so instead of naively calling dense_size_str(), we filter out
         # reduction block from accumulator. 
-        # In bmm (Z,X,R)x(Z,R,Y) case, we also remove z dimension from accumulator
-        # because 3d (Z,X,Y) tl.dot is somehow slower than 2d (X,Y) tl.dot.
+        # In bmm (Z,Y,R)x(Z,R,X) case, we also remove z dimension from accumulator
+        # because 3d (Z,Y,X) tl.dot is somehow slower than 2d (Y,X) tl.dot.
         # We force ZBLOCK to be always 1 during autotune.
         dense_size_str : str
         if reduction_type == "dot" :
             dense_sizes = self.dense_size_list()
-            assert len(dense_sizes) >= 3
-            xy_sizes_only = [ 
-                size for size in dense_sizes 
-                if "X" in size or "Y" in size
-            ]
-            dense_size_str = f"[{', '.join(xy_sizes_only)}]"
+            assert (len(dense_sizes) >= 3
+                and "XBLOCK" in dense_sizes
+                and "YBLOCK" in dense_sizes)
+            dense_size_str = "[YBLOCK, XBLOCK]"
         else :
             dense_size_str = self.dense_size_str()
 
@@ -2738,12 +2730,11 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             if not isinstance(default, tuple):
                 if reduction_type == "dot" :
                     dense_sizes = self.dense_size_list()
-                    assert len(dense_sizes) >= 3
-                    xy_sizes_only = [ 
-                        size for size in dense_sizes 
-                        if "X" in size or "Y" in size
-                    ]
-                    dense_size_str = f"[{', '.join(xy_sizes_only)}]"
+                    assert (len(dense_sizes) >= 3 
+                        and "XBLOCK" in dense_sizes
+                        and "YBLOCK" in dense_sizes)
+                    
+                    dense_size_str = "[YBLOCK, XBLOCK]" # transposed
                     self.body.writeline(
                         f"{accumulator} = tl.full({dense_size_str}, {default}, {acc_type})"
                     )

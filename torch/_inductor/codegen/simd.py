@@ -388,6 +388,12 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
         )
         self.no_x_dim = self.want_no_x_dim()
         self.code_hash: Optional[str] = None
+        
+        self.is_dot_reduction = False
+        for node in self.features.node_schedule:
+            if isinstance(node, scheduler.SchedulerNode):
+                if node.node.get_reduction_type() == "dot":
+                    self.is_dot_reduction = True
 
         # define this in a closure to make cache local to object
         @functools.lru_cache(None)
@@ -425,6 +431,7 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
         numels: dict[str, sympy.Expr],
         no_x_dim: bool,
     ) -> list[IterationRangesRoot]:
+
         active_prefixes = OrderedSet(
             prefix for prefix in all_prefixes if prefix in numels
         )
@@ -512,14 +519,13 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
         return sum(int(tree.tensor_dim is not None) for tree in self.range_trees)
 
     def indexing_size_str(self, i: int) -> str:
-        is_dot_reduction = self.features.node_schedule[0].node.get_reduction_type() == "dot"
-        if is_dot_reduction :
+        if self.is_dot_reduction :
             is_x = i == 0
             is_y = i == 1
             if is_x :
-                return "[:,None]"
-            elif is_y :
                 return "[None,:]"
+            elif is_y :
+                return "[:,None]"
             else : # is_z, is_r
                 return ""
         else :
@@ -1974,6 +1980,8 @@ class SIMDScheduling(BaseScheduling):
         # force tiling to be {'y':M, 'x':N, 'r0_':K}
         for node in EnableReduction.filter(node_schedule):
             if node.node.get_reduction_type() == "dot" :
+                #range_y_x = list(reversed(node.node.data.ranges))
+                #range_r = node.node.data.reduction_ranges
                 node_ranges = node.get_ranges()
                 range_y_x = node_ranges[0] #(M,N)
                 range_r = node_ranges[1]   #(K)
