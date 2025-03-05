@@ -1864,7 +1864,10 @@ class SIMDScheduling(BaseScheduling):
 
         Returns a list of tilings ranked by dimensionality.
         """
-        is_pointwise = reduction_numel == 1
+        is_pointwise = (
+            reduction_numel == 1 
+            or config.triton.always_nd_tile_pointwise
+        )
         tilings = OrderedSet[dict[str, sympy.Expr]]()
         for node in EnableReduction.filter(node_schedule):
             if not isinstance(node, scheduler.SchedulerNode):
@@ -1873,12 +1876,13 @@ class SIMDScheduling(BaseScheduling):
             # If this is a reduction schedule, skip nodes which are missing their
             # reduction ranges.
             node_ranges = node.get_ranges()
+            
             if not is_pointwise and len(node_ranges[1]) == 0:
                 continue
             # Use the node ranges as the default tiling candidate.
             ranges_to_tile = node_ranges[0 if is_pointwise else 1]
-            node_tilings = [ranges_to_tile]
             
+            node_tilings = [ranges_to_tile]
             # Search the indexing expressions for more candidates.
             # If we see modular indexing, try to subdivide ranges into their implied
             # block shape.
@@ -1899,7 +1903,7 @@ class SIMDScheduling(BaseScheduling):
                         pointwise_vars_numel, pointwise_numel
                     ):
                         break
-
+                
                 # Reject the split if it does not match the total pointwise numel.
                 if not sizevars.statically_known_equals(
                     pointwise_vars_numel, pointwise_numel
@@ -1937,7 +1941,7 @@ class SIMDScheduling(BaseScheduling):
                     index_tiling.extend(dims)
 
                 node_tilings.append(index_tiling)
-
+            
             # Flatten leading dimensions, assigning labels to each dim.
             for node_tiling in node_tilings:
                 num_leading_dims = max(0, len(node_tiling) - config.triton.max_tiles)
@@ -1953,7 +1957,7 @@ class SIMDScheduling(BaseScheduling):
                         reduction_numel,
                     )
                 )
-
+        
         # Rank tilings by the number of dimensions. E.g., prefer 2D to 1D.
         # Since this is a stable sort, ties are broken by schedule order.
         ranked_tilings = sorted(
@@ -1980,17 +1984,21 @@ class SIMDScheduling(BaseScheduling):
         # force tiling to be {'y':M, 'x':N, 'r0_':K}
         for node in EnableReduction.filter(node_schedule):
             if node.node.get_reduction_type() == "dot" :
-                #range_y_x = list(reversed(node.node.data.ranges))
-                #range_r = node.node.data.reduction_ranges
                 node_ranges = node.get_ranges()
-                range_y_x = node_ranges[0] #(M,N)
+                range_zyx = node_ranges[0] #(M,N)
                 range_r = node_ranges[1]   #(K)
-                tiling =  cls.create_tiling(range_y_x, range_r)
+                tiling =  cls.create_tiling(range_zyx, range_r)
                 return tiling
-
  
         # If this is a reduction, only tile reduction dims.
-        is_pointwise = reduction_numel == 1
+        is_pointwise = (
+            reduction_numel == 1
+            or (
+                config.triton.always_nd_tile_pointwise
+                and config.triton.prefer_nd_tiling
+                and len(node.get_ranges()[0]) >= 2
+            )
+        )
 
         # Tiled reductions are gated by a config flag.
         default_tiling = cls.create_tiling([numel], [reduction_numel])

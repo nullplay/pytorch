@@ -1935,8 +1935,11 @@ def _reduction_configs(
         min(rnumel, MAX_R0_BLOCK),
         register_intensive=register_intensive,
     )
-   
-    if triton_meta["dot_reduction"] :
+    
+    if (
+        triton_meta["dot_reduction"] 
+        or triton_meta["always_nd_tile_pointwise"] 
+    ):
         if len(size_hints) == 3 :
             return triton_dot_reduction_mm_configs
         elif len(size_hints) == 4:
@@ -1977,6 +1980,7 @@ def reduction(
     """args to @triton.heuristics()"""
     inductor_meta = {} if inductor_meta is None else inductor_meta
     inductor_meta["reduction_hint"] = reduction_hint
+
     if inductor_meta.get("no_x_dim"):
         size_hints["x"] = 1
 
@@ -1988,7 +1992,6 @@ def reduction(
         inductor_meta=inductor_meta,
         triton_meta=triton_meta
     )
-    
     return cached_autotune(
         size_hints,
         configs=configs,
@@ -2102,6 +2105,26 @@ def persistent_reduction(
 ):
     inductor_meta = {} if inductor_meta is None else inductor_meta
     inductor_meta["reduction_hint"] = reduction_hint
+    
+    # This kernel's reduction is not tiled due to 
+    # config.triton.always_nd_tile_pointwise
+    if (
+        "x" in size_hints
+        and "y" in size_hints 
+        and triton_meta["always_nd_tile_pointwise"]
+        and not triton_meta["dot_reduction"]
+    ):        
+        return pointwise(
+            {
+                var: size 
+                for var, size in size_hints.items() 
+                if var in ["x", "y", "z"]
+            },
+            triton_meta = triton_meta,
+            filename=filename,
+            inductor_meta=inductor_meta
+        )
+
     if inductor_meta.get("no_x_dim"):
         size_hints["x"] = 1
 

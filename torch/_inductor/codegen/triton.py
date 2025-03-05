@@ -795,33 +795,34 @@ class TritonCSEVariable(CSEVariable):
         # We handle this by hooking when cse.update_on_args is called.
         # Since when cse.update_on_args got called, we already generated the code into 
         # triton kernel and V.kernel.cse._cache, we modify the cse._cache and triton kernel
-        r_suffix = ""
-        if dep_x :
-            r_suffix = "[:,None]"
-        elif dep_y :
-            r_suffix = "[None,:]"
-       
-        cached_codes = list(V.kernel.cse._cache.keys())
-        cached_csevar = list(V.kernel.cse._cache.values())
-        already_written_code = f"{self.name} = {cached_codes[cached_csevar.index(self)]}"
-        assert not (only_dep_r_args and dep_x and dep_y), "x,y,r all cannot depend for same var"
-        if only_dep_r_args and (dep_x or dep_y) :
-            assert V.kernel.cse.contains(f"{cached_codes[cached_csevar.index(self)]}")
-        for rarg in only_dep_r_args :
-            assert isinstance(rarg, TritonCSEVariable)
-            prev_name = rarg.name
-            new_name = prev_name + r_suffix
-            new_written_code = already_written_code.replace(prev_name, new_name)
+        if V.kernel.is_dot_reduction and V.kernel.inside_reduction :
+            r_suffix = ""
+            if dep_x :
+                r_suffix = "[:,None]"
+            elif dep_y :
+                r_suffix = "[None,:]"
+           
+            cached_codes = list(V.kernel.cse._cache.keys())
+            cached_csevar = list(V.kernel.cse._cache.values())
+            already_written_code = f"{self.name} = {cached_codes[cached_csevar.index(self)]}"
+            assert not (only_dep_r_args and dep_x and dep_y), "x,y,r all cannot depend for same var"
+            if only_dep_r_args and (dep_x or dep_y) :
+                assert V.kernel.cse.contains(f"{cached_codes[cached_csevar.index(self)]}")
+            for rarg in only_dep_r_args :
+                assert isinstance(rarg, TritonCSEVariable)
+                prev_name = rarg.name
+                new_name = prev_name + r_suffix
+                new_written_code = already_written_code.replace(prev_name, new_name)
 
-            # update cse cache
-            V.kernel.cse.put(new_name, new_written_code)
-            
-            # I'm not sure where did we write "already_written_code"
-            # So check compute and body (there might be more)
-            if V.kernel.compute._lines[-1] == already_written_code :
-                V.kernel.compute._lines[-1] = new_written_code
-            if V.kernel.body._lines[-1] == already_written_code :
-                V.kernel.body._lines[-1] = new_written_code
+                # update cse cache
+                V.kernel.cse.put(new_name, new_written_code)
+                
+                # I'm not sure where did we write "already_written_code"
+                # So check compute and body (there might be more)
+                if V.kernel.compute._lines[-1] == already_written_code :
+                    V.kernel.compute._lines[-1] = new_written_code
+                if V.kernel.body._lines[-1] == already_written_code :
+                    V.kernel.body._lines[-1] = new_written_code
 
 
 def maybe_upcast_float32(convert_output: bool = True) -> Callable[[_T], _T]:
@@ -3666,8 +3667,14 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             "device": DeviceProperties.create(V.graph.get_current_device_or_throw()),
             "constants": {},
             "dot_reduction": self.is_dot_reduction,
+            "always_nd_tile_pointwise": (
+                config.triton.always_nd_tile_pointwise 
+                and 'x' in self.numels
+                and 'y' in self.numels
+                and 'r0_' in self.numels
+            ),
         }
-
+        
         # Skip memory optimization for forward of the training loop where we expect
         # every new node will increase the peak memory and our greedy approach would
         # introduce a lot of unnecessary cpu copies.

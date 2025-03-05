@@ -1897,10 +1897,10 @@ class GraphLowering(torch.fx.Interpreter):
     def codegen(self) -> tuple[str, list[tuple[int, Node]]]:
         with dynamo_timed("GraphLowering.codegen", log_pt2_compile_event=True):
             self.init_wrapper_code()
-
+            
             self._update_scheduler()
             V.debug.draw_orig_fx_graph(self.orig_gm, self.scheduler.nodes)
-
+            
             self.wrapper_code.push_codegened_graph(self)
             self.scheduler.codegen()
 
