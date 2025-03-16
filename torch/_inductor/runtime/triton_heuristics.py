@@ -509,6 +509,11 @@ class CachingAutotuner(KernelInterface):
             "options": options,
         }
 
+        log.debug(
+            "Triton try compile - metadata: %s",
+            compile_meta,
+        )
+
         try:
             binary = triton.compile(*compile_args, **compile_kwargs)
         except Exception:
@@ -519,7 +524,12 @@ class CachingAutotuner(KernelInterface):
                 compile_meta,
             )
             raise
-
+        
+        log.debug(
+            "Triton compile success - metadata: %s",
+            compile_meta,
+        )
+ 
         TritonBundler.put(
             triton_hash_to_path_key(binary.hash), self.triton_meta.get("device", 0)
         )
@@ -760,7 +770,7 @@ class CachingAutotuner(KernelInterface):
             grid_x, grid_y, grid_z = grid(launcher.config.kwargs)
         else:
             grid_x, grid_y, grid_z = grid
-
+        
         key = self.inductor_meta.get("kernel_name", None)  # unique kernel name
         assert key is not None, "kernel_name can not be None"
         params = {
@@ -791,7 +801,7 @@ class CachingAutotuner(KernelInterface):
             "meta": launcher.config.kwargs,
         }
         from torch._inductor.codecache import CudaKernelParamCache
-
+        breakpoint()
         bin_type = {"hip": "hsaco", "xpu": "spv"}.get(self.device_props.type, "cubin")
         binary = launcher.bin.asm[bin_type]
         CudaKernelParamCache.set(key, params, binary, bin_type)
@@ -888,7 +898,7 @@ class CachingAutotuner(KernelInterface):
 
         if self.dump_launch_params:
             _dump_launch_params(args, kwargs, launcher, self.fn.__name__)
-
+        
         # it is faster than entering and exiting a context manager, even if the context
         # manager is a nullcontext.
         if autograd_profiler._is_profiler_enabled:
@@ -1080,14 +1090,22 @@ class TritonCompileResult:
             "function": get_first_attr(binary, "function", "cu_function"),
             "runner": get_first_attr(binary, "run", "c_wrapper"),
         }
+ 
+        # for batch matmul, we permute the program_id (z,y,x) = (2,1,0) to (0,1,2)
+        # this is because usually batch can easily go more than 65536. 
+        # we also reflect this at codegen 
+        is_bmm_dot_reduction = (
+            compile_meta.get("dot_reduction", False)
+            and "ZBLOCK" in compile_meta.get("constants",[])
+        )
 
         if not hasattr(binary, "launch_metadata"):
             # launch args before CompiledKernel.launch_metadata is added.
             # TODO(jansel): delete this branch in mid-2025
             runner_args = [
-                "grid_0",
+                "grid_0" if not is_bmm_dot_reduction else "grid_2",
                 "grid_1",
-                "grid_2",
+                "grid_2" if not is_bmm_dot_reduction else "grid_0",
                 "num_warps",
                 "*cta_args",
                 "shared",
@@ -1111,9 +1129,9 @@ class TritonCompileResult:
             else:
                 launch_metadata = "None"
             runner_args = [
-                "grid_0",
+                "grid_0" if not is_bmm_dot_reduction else "grid_2",
                 "grid_1",
-                "grid_2",
+                "grid_2" if not is_bmm_dot_reduction else "grid_0",
                 "stream",
                 "function",
                 "metadata",

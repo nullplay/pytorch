@@ -229,10 +229,17 @@ class IndexingOptions:
        
         depend_indices = OrderedSet([])
         for var in index_vars:
+            # if var is in [x,y,z,r0,r1]
             for symt in TritonSymbols.block_types:
                 if symbol_is_type(var, symt):
                     depend_indices.add(f"{prefix_str[symt]}")
                     break
+            
+            # if var is tmp (indirect)
+            if symbol_is_type(var, SymT.TMP):
+                cse_var = V.kernel.cse.varname_map[var.name]
+                depend_indices |= cse_var.depend_indices
+
         
         return depend_indices 
 
@@ -758,8 +765,9 @@ class TritonCSEVariable(CSEVariable):
     def update_on_args(self, name, args, kwargs):
         dep_x = False
         dep_y = False
+        dep_z = False
         dep_r = False
-        only_dep_r_args = []
+        only_dep_zr_args = []
         for arg in args:
             if isinstance(arg, TritonCSEVariable):
                 self.mask_vars.update(arg.mask_vars)
@@ -767,11 +775,13 @@ class TritonCSEVariable(CSEVariable):
                 
                 dep_x_arg = prefix_str[SymT.XBLOCK] in arg.depend_indices
                 dep_y_arg = prefix_str[SymT.YBLOCK] in arg.depend_indices
+                dep_z_arg = prefix_str[SymT.ZBLOCK] in arg.depend_indices
                 dep_r_arg = prefix_str[SymT.R0_INDEX] in arg.depend_indices
-                if dep_r_arg and not dep_x_arg and not dep_y_arg:
-                    only_dep_r_args.append(arg)
+                if (dep_z_arg or dep_r_arg) and not dep_x_arg and not dep_y_arg:
+                    only_dep_zr_args.append(arg)
                 dep_x |= dep_x_arg
                 dep_y |= dep_y_arg
+                dep_z |= dep_z_arg
                 dep_r |= dep_r_arg
             elif isinstance(arg, sympy.Symbol):
                 # most of the time index vars don't need masks associated with them
@@ -791,27 +801,26 @@ class TritonCSEVariable(CSEVariable):
         # tmp3 = tmp1 * tmp2 #(r,x)
         # 
         # We can see that tmp3 is depending on x and r so the correct indexing would be
-        # adding suffix [:,None] to tmp2 tmp3 = tmp1 * tmp2[:,None].
+        # adding suffix [:,None] to tmp2 -> tmp3 = tmp1 * tmp2[:,None].
         # We handle this by hooking when cse.update_on_args is called.
         # Since when cse.update_on_args got called, we already generated the code into 
         # triton kernel and V.kernel.cse._cache, we modify the cse._cache and triton kernel
         if V.kernel.is_dot_reduction and V.kernel.inside_reduction :
-            r_suffix = ""
+            zr_suffix = ""
             if dep_x :
-                r_suffix = "[:,None]"
+                zr_suffix = "[:,None]"
             elif dep_y :
-                r_suffix = "[None,:]"
-           
+                zr_suffix = "[None,:]"
             cached_codes = list(V.kernel.cse._cache.keys())
             cached_csevar = list(V.kernel.cse._cache.values())
             already_written_code = f"{self.name} = {cached_codes[cached_csevar.index(self)]}"
-            assert not (only_dep_r_args and dep_x and dep_y), "x,y,r all cannot depend for same var"
-            if only_dep_r_args and (dep_x or dep_y) :
+            assert not (only_dep_zr_args and dep_x and dep_y), "x,y,r all cannot depend for same var"
+            if only_dep_zr_args and (dep_x or dep_y) :
                 assert V.kernel.cse.contains(f"{cached_codes[cached_csevar.index(self)]}")
-            for rarg in only_dep_r_args :
-                assert isinstance(rarg, TritonCSEVariable)
-                prev_name = rarg.name
-                new_name = prev_name + r_suffix
+            for zrarg in only_dep_zr_args :
+                assert isinstance(zrarg, TritonCSEVariable)
+                prev_name = zrarg.name
+                new_name = prev_name + zr_suffix
                 new_written_code = already_written_code.replace(prev_name, new_name)
 
                 # update cse cache
@@ -2093,7 +2102,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         
        
         if self.current_node is not None :
-            if self.is_dot_reduction and self.inside_reduction :
+            if self.is_dot_reduction and self.inside_reduction:
                 def is_dependent(var:sympy.Symbol, sym:SymT) :
                     result = False
                     result |= symbol_is_type(var, sym)
@@ -2377,7 +2386,6 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         assert isinstance(result_var, TritonCSEVariable)
         result_var.mask_vars = indexing.mask_vars  # type: ignore[assignment]
         result_var.depend_indices = indexing.get_depend_indices() 
-
         if append_broadcast:
             line = f"tl.broadcast_to({result_var}, {append_broadcast})"
             result_var = self.cse.generate(load_buffer, line, dtype=dtype)
@@ -3934,6 +3942,19 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
     def iteration_ranges_get_pid(self, entry: IterationRangesRoot) -> str:
         assert entry.grid_dim is not None
         key = f"tl.program_id({entry.grid_dim})"
+        
+        # for batch matmul, we permute the program_id (z,y,x) = (2,1,0) to (0,1,2)
+        # this is because usually batch can easily go more than 65536. 
+        # we also reflect this at launcher in _inductor/runtime/triton_heuristics.py
+        is_bmm_dot_reduction = self.is_dot_reduction and len(self.range_trees)==4
+        if is_bmm_dot_reduction:
+            if entry.grid_dim == 2 : # z
+                key = f"tl.program_id(0)"
+            elif entry.grid_dim == 1 : #y
+                key = f"tl.program_id(1)"
+            elif entry.grid_dim == 0 : #x
+                key = f"tl.program_id(2)"
+
         # y_grid has a limit, so express it in terms of y and z in case of overflow.
         # z grid is only exercised when max_tiles == 3 (off by default).
         if (
