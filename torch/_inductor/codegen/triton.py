@@ -2151,7 +2151,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 z_suffix = ""
                 indexing_dim = dep_xindex + dep_yindex + dep_rindex
                 no_xy_mask = not any(var.startswith(("x", "y")) for var in mask_vars) 
-
+                
                 new_mask_vars = [] 
                 for var in mask_vars:
                     if var[0] == "r":
@@ -4031,6 +4031,14 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
         # can be added as an override_mask
         mask_vars.discard("None")
+
+        # patterns like mask[:,None] should be removed.
+        # indexing function can only handle pure mask
+        if self.is_dot_reduction:
+            mask_vars_clone = list(mask_vars)
+            for mask in mask_vars_clone:
+                if "[" in mask and "]" in mask: 
+                    mask_vars.discard(mask)
 
     @cache_on_self
     def get_reduction_prefixes(self) -> list[str]:

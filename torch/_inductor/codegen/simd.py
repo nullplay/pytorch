@@ -1950,6 +1950,15 @@ class SIMDScheduling(BaseScheduling):
                 collapsed_splits = (collapsed_leading_dim,) + tuple(
                     node_tiling[first_trailing_dim:]
                 )
+                
+                # Reject if there is a tile size = 1
+                if any([
+                    V.graph.sizevars.statically_known_equals(
+                        split, sympy.S.One
+                    ) for split in collapsed_splits
+                ]):
+                    continue
+
                 tilings.add(
                     cls.complete_partial_tiling(
                         cls.create_partial_tiling(collapsed_splits, is_pointwise),
@@ -1965,7 +1974,6 @@ class SIMDScheduling(BaseScheduling):
             key=len,
             reverse=True,
         )
-        
         return ranked_tilings
 
     @classmethod
@@ -2037,7 +2045,7 @@ class SIMDScheduling(BaseScheduling):
             candidate_tiling.tiling
             for candidate_tiling, score in candidate_tiles.most_common()
         ]
-       
+        
         if config.triton.max_tiles >= 3 and is_pointwise:
             # Consider adding a third dimension of tiling, but only
             # when a1 is a multiple of b1; otherwise, you have a lot
@@ -2086,7 +2094,7 @@ class SIMDScheduling(BaseScheduling):
                 cls.get_nd_tilings(node_schedule, numel, reduction_numel)
                 + ranked_tilings
             )
-        
+         
         for tiling in ranked_tilings:
             assert isinstance(tiling, dict)
             if all(
