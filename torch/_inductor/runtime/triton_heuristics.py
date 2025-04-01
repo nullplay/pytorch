@@ -596,7 +596,6 @@ class CachingAutotuner(KernelInterface):
             from torch._inductor.utils import do_bench_using_profiling
 
             return do_bench_using_profiling(kernel_call, warmup=10, rep=40)
-
         if self.device_props.type == "cpu":
             return benchmarker.benchmark_cpu(kernel_call)
         return benchmarker.benchmark_gpu(kernel_call, rep=40)
@@ -801,7 +800,6 @@ class CachingAutotuner(KernelInterface):
             "meta": launcher.config.kwargs,
         }
         from torch._inductor.codecache import CudaKernelParamCache
-        breakpoint()
         bin_type = {"hip": "hsaco", "xpu": "spv"}.get(self.device_props.type, "cubin")
         binary = launcher.bin.asm[bin_type]
         CudaKernelParamCache.set(key, params, binary, bin_type)
@@ -2180,7 +2178,7 @@ def split_scan(
     if len(size_hints) != 2:
         raise NotImplementedError(f"size_hints: {size_hints}")
 
-    configs = _reduction_configs(size_hints=size_hints, inductor_meta=inductor_meta)
+    configs = _reduction_configs(size_hints=size_hints, inductor_meta=inductor_meta, triton_meta=triton_meta)
 
     # Fixup configs to enforce the minimum Rn_BLOCK size
     min_rblock = inductor_meta.get("min_split_scan_rblock", 256)
