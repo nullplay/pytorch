@@ -17,6 +17,7 @@ from ..pattern_matcher import (
     Match,
     PatternMatcherPass,
     register_graph_pattern,
+    register_lowering_pattern,
     register_replacement,
     stable_topological_sort,
 )
@@ -213,7 +214,6 @@ def addmm_patterns_init():
         extra_check=check_concat_weights,
         exclusive_arg_names=("w1", "w2", "w3", "b1", "b2", "b3"),
     )
-
 
 def same_dtype(match):
     return match.output_node().args[0].meta["val"].dtype == match.kwargs["dtype"]

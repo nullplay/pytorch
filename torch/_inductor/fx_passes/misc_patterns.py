@@ -6,7 +6,7 @@ from torch._dynamo.utils import counters
 from torch._ops import OpOverload, OpOverloadPacket
 from torch.utils._ordered_set import OrderedSet
 
-from ..pattern_matcher import fwd_only, register_replacement
+from ..pattern_matcher import fwd_only, register_replacement, Match
 
 
 aten = torch.ops.aten
@@ -66,6 +66,44 @@ def _misc_patterns_init():
         fwd_only,
         [post_grad_patterns, joint_graph_patterns],
         scalar_workaround={"slice_shape": 42},
+    )
+
+
+    # Patterns regarding use_dot_reduction
+    def _return_dot_enabled(match:Match) -> bool:
+        return torch._inductor.config.triton.use_dot_reduction
+
+
+    def mm_pattern(mat1, mat2):
+        return mat1 @ mat2
+
+    def mm_replacement(mat1, mat2):
+        return (mat1.unsqueeze(-1) * mat2.unsqueeze(0)).sum(dim=1)
+
+    register_replacement(
+        mm_pattern,
+        mm_replacement,
+        [torch.empty(10,10,device="cuda"), torch.empty(10,10,device="cuda")],
+        fwd_only,
+        [post_grad_patterns, joint_graph_patterns],
+        exclusive_arg_names=("mat1", "mat2"),
+        extra_check=_return_dot_enabled,
+    )
+
+    def bmm_pattern(mat1, mat2):
+        return torch.bmm(mat1, mat2)
+
+    def bmm_replacement(mat1, mat2):
+        return (mat1.unsqueeze(-1) * mat2.unsqueeze(1)).sum(dim=2)
+
+    register_replacement(
+        bmm_pattern,
+        bmm_replacement,
+        [torch.empty(10,10,10,device="cuda"), torch.empty(10,10,10,device="cuda")],
+        fwd_only,
+        [post_grad_patterns, joint_graph_patterns],
+        exclusive_arg_names=("mat1", "mat2"),
+        extra_check=_return_dot_enabled,
     )
 
 

@@ -26,6 +26,11 @@ from ..codegen.common import BackendFeature, has_backend_feature
 from ..comms import remove_fsdp2_unsharded_param_graph_input_usage
 from ..fx_utils import FakeTensorUpdater, get_fake_args_kwargs, get_node_storage
 from ..lowering import lowerings as L
+from ..lowering import (
+    make_pointwise,
+    make_reduction,
+    transform_args
+)
 from ..pattern_matcher import (
     _return_true,
     Arg,
@@ -247,6 +252,68 @@ def register_lowering_pattern(
 #   - later output nodes first
 #   - order patterns are defined in
 ################################################################################
+
+def is_valid_dot(match: Match):
+    rdim = match.kwargs["dim"]
+    if len(rdim) > 1 :
+        return False
+    rdim = rdim[0]
+
+    if not torch._inductor.config.triton.use_dot_reduction :
+        return False
+
+    shape1 = match.kwargs["mat1"].meta.get("tensor_meta").shape
+    shape2 = match.kwargs["mat2"].meta.get("tensor_meta").shape
+    if shape1[rdim] != shape2[rdim]:
+        return False
+
+    if shape1[rdim] < torch._inductor.config.unroll_reductions_threshold:
+        return False
+
+    if len(shape1) != len(shape2) :
+        return False
+
+    # mm case
+    # (M,K,1) x (1,K,N)
+    if len(shape1) == 3:
+        if shape1[2] == 1 or shape2[0] == 1 :
+            torch._inductor.config.unroll_reductions_threshold = 33
+            return False
+        if shape1[2] == 1 and shape2[0] == 1 :
+            return True
+
+    # bmm case
+    # (P,M,K,1) x (P,1,K,N)
+    elif len(shape1) == 4:
+        if shape1[1] == 1 or shape2[3] == 1 :
+            # TODO: need to figure out good thresholds or criteria to unroll.
+            torch._inductor.config.unroll_reductions_threshold = 33
+            return False
+        if shape1[3] == 1 and shape2[1] == 1 :
+            return True
+
+    return False
+
+@register_lowering_pattern(
+    CallFunction(
+        aten.sum.dim_IntList,
+        CallFunction(aten.mul, KeywordArg("mat1"), KeywordArg("mat2")),
+        KeywordArg("dim"),
+    ),
+    extra_check=is_valid_dot,
+)
+def dot(match: Match, mat1, mat2, dim):
+    args, kwargs = transform_args(
+        args=[mat1, mat2],
+        kwargs={},
+        broadcast=True,
+        type_promotion_kind=None,
+        convert_input_to_bool=False
+    ) # Handles broadcasting the arguments
+    mul_pointwise = make_pointwise(ops.dot)(*args)
+    new_reduction = make_reduction("dot")(mul_pointwise, dim,)
+    return new_reduction
+
 
 
 def is_valid_mm_plus_mm(match: Match):
