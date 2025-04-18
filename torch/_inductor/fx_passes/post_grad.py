@@ -258,7 +258,7 @@ def is_valid_dot(match: Match):
     if len(rdim) > 1 :
         return False
     rdim = rdim[0]
-
+    
     if not torch._inductor.config.triton.use_dot_reduction :
         return False
 
@@ -272,11 +272,11 @@ def is_valid_dot(match: Match):
 
     if len(shape1) != len(shape2) :
         return False
-
+    
     # mm case
     # (M,K,1) x (1,K,N)
     if len(shape1) == 3:
-        if shape1[2] == 1 or shape2[0] == 1 :
+        if shape1[0] == 1 or shape2[2] == 1 :
             torch._inductor.config.unroll_reductions_threshold = 33
             return False
         if shape1[2] == 1 and shape2[0] == 1 :
