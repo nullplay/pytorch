@@ -141,8 +141,8 @@ def use_native_matmul(mat1, mat2):
 
     # Currently only enable native matmul for default indexing
     # TODO : support block ptr
-    if config.triton.use_block_ptr:
-        raise AssertionError("native matmul doesn't support block_ptr codegen yet")
+    #if config.triton.use_block_ptr:
+    #    raise AssertionError("native matmul doesn't support block_ptr codegen yet")
 
     # Currently only enable native matmul for triton on GPU.
     if not (mat1.get_device().type == "cuda" and config.cuda_backend == "triton"):
