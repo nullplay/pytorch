@@ -4108,6 +4108,8 @@ class ShapeEnv:
         self.var_to_range_sloc: dict[sympy.Symbol, ValueRangesSLoc] = {}
         self.source_name_to_debug_name: dict[str, str] = {}
         self.var_to_sources: dict[sympy.Symbol, list[Source]] = {}
+        # Jagged size symbols (torch.ops.jagged.view) -> (dim their length depends on, NNZ of the packed storage).
+        self.jagged_symbols: dict[sympy.Symbol, tuple[int, IntLikeType]] = {}
         # A set of unbacked symbols that are inputs (i.e: not data dependent).
         self.unbacked_inputs: OrderedSet[sympy.Symbol] = OrderedSet()
         self.var_to_stack: dict[sympy.Symbol, CapturedTraceback] = {}

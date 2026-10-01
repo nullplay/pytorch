@@ -511,6 +511,8 @@ class SizeVarAllocator:
                 sizes[i] = None
 
         def can_merge_dims(a, b):
+            if V.graph.jagged and V.graph.jagged.keys() & (sizes[a] * sizes[b]).free_symbols:
+                return False  # a jagged dim stays its own loop (flattened with its parent, or a jagged loop)
             for k in range(len(strides)):
                 if self.simplify(strides[k][a] * sizes[a]) == self.simplify(
                     strides[k][b]
@@ -1339,6 +1341,10 @@ class SizeVarAllocator:
         for v in index.free_symbols:
             if symbol_is_type(v, SymT.INDIRECT):  # type: ignore[attr-defined]
                 index = sympy_subs(index, {v: 0})  # type: ignore[dict-item]
+        if V.graph.jagged:
+            from .jagged import dense_equivalent
+
+            index = dense_equivalent(index)
         result = []
         for s in self.stride_vars(index, vars, support_vars):
             result.append(self.optimization_hint(s, fallback=0))

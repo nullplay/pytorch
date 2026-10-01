@@ -3405,10 +3405,12 @@ class Sort(Loops):
 
 def is_storage_and_layout(x: IRNode) -> bool:
     try:
-        as_storage_and_layout(x, freeze=False)
-        return True
+        _, layout = as_storage_and_layout(x, freeze=False)
     except NotImplementedError:
         return False
+    # a jagged layout (off[b] + j, jagged.JaggedLayout) has no strides: views of it stay reindexing views over its
+    # indexer instead of a ReinterpretView with new strides
+    return getattr(layout, "strided", True)
 
 
 def is_contiguous_storage_and_layout(x: IRNode) -> bool:

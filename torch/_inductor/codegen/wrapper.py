@@ -5255,6 +5255,13 @@ class PythonWrapperCodegen(CodeGen):
         allocation_shape = tuple(V.graph.get_allocation_size(buffer))
         stride = tuple(buffer.get_stride())
         is_pinned = buffer.get_is_pinned()
+        if getattr(V.graph, "jagged", None):
+            from ..jagged import JaggedLayout
+
+            if isinstance(layout := buffer.get_layout(), JaggedLayout):
+                # packed storage [NNZ, *D]; the [B, J, *D] view only exists inside kernels
+                shape = allocation_shape = (layout.nnz, *layout.size[2:])
+                stride = tuple(layout.stride[1:])
         return self.make_allocation(
             buffer.get_name(), device, dtype, shape, stride, allocation_shape, is_pinned
         )

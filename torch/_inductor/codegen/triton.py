@@ -3455,6 +3455,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         TensorDescriptorOptions
     )
     transpose_discontiguous_tensor_descriptors_override: bool | None = None
+    # jagged dim in the reduction tree: its numel is per lane, off[b + 1] - off[b] (jagged.JaggedLoop)
+    jagged: Any = None
 
     def __init__(
         self,
@@ -3515,7 +3517,11 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         self.autotune_hints = OrderedSet[AutotuneHint]()
         self.triton_meta: TritonMeta | None = None
 
-        if self.inside_reduction:
+        if (J := self._jagged_loop_symbol()) is not None:
+            from ..jagged import JaggedLoop
+
+            self.jagged = JaggedLoop(self, J)  # emits rnumel itself, once the row of a lane is known
+        elif self.inside_reduction:
             self.codegen_reduction_numels(self.body)
 
         if self.cooperative_reduction:
@@ -3926,8 +3932,21 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
     def dtype_to_str(self, dtype: torch.dtype) -> str:
         return triton_type(dtype)
 
+    @cache_on_self
+    def _jagged_loop_symbol(self) -> sympy.Symbol | None:
+        if not getattr(V.graph, "jagged", None):
+            return None
+        from ..jagged import jagged_loop
+
+        return jagged_loop(self.features.reduction_numel)
+
+    def _is_jagged_tree(self, tree: IterationRanges) -> bool:
+        return self.jagged is not None and tree is self.jagged.tree
+
     def should_use_cooperative_reduction(self) -> bool:
         if self._strict_reduction_rblock() is not None:
+            return False
+        if self._jagged_loop_symbol() is not None:
             return False
         return self.inside_reduction and V.choices.should_use_cooperative_reduction(
             V.graph.get_current_device_or_throw(),
@@ -4032,6 +4051,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
     def should_use_persistent_reduction(self) -> bool:
         if not self.inside_reduction:
             return False
+        if self._jagged_loop_symbol() is not None:
+            return False  # the jagged extent is only known in-kernel: loop over it
         # ops.sort requires persistent reduction (TritonKernel.sort asserts it), so the
         # heuristic must never say otherwise. Enforcing it here covers every construction
         # path, including ones that don't apply apply_feature_required_overrides.
@@ -4051,6 +4072,11 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         return self.features.strict_reduction_rblock()
 
     def want_no_x_dim(self):
+        if (J := self._jagged_loop_symbol()) is not None:
+            from ..jagged import _depend_size
+
+            # p0 only: one row per program when the pointwise dims are exactly the rows
+            return V.graph.sizevars.statically_known_equals(self.features.numel, _depend_size(J))
         return (
             self.persistent_reduction
             and len(self.numels) == self.num_reduction_dims + 1
@@ -7962,6 +7988,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         mutated_args = sorted(mutated_args)
 
         for tree in self.active_range_trees():
+            if self._is_jagged_tree(tree):
+                continue  # defined in-kernel from offsets
             sizearg = SizeArg(f"{tree.prefix}numel", tree.numel)
             signature.append(sizearg)
             argdefs.append(ArgName(sizearg.name))
@@ -8276,6 +8304,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
     def add_numel_to_call_args(self, name, call_args, arg_types):
         # TODO(jansel): if there are constants, we shouldn't bother passing them as args
         for tree in self.range_trees:
+            if self._is_jagged_tree(tree):
+                continue  # defined in-kernel from offsets
             if isinstance(tree.numel, (sympy.Integer, sympy.Symbol)):
                 expr = tree.numel
             else:
@@ -8411,6 +8441,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
     def _has_constant_mask(self, tree: IterationRangesRoot) -> bool:
         if not tree.supports_constant_mask():
+            return False
+
+        if self._is_jagged_tree(tree):
             return False
 
         if self.is_native_matmul:
@@ -8622,6 +8655,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             )
         if self._has_constant_mask(entry):
             code.writeline(self.create_constant_mask(entry))
+        elif self._is_jagged_tree(entry):
+            code.writeline(f"{entry.mask_name()} = {entry.name} < {self.jagged.mask_bound()}")
         elif not (x == "x" and self.mix_order_reduction):
             # mix order reduction should generate xmask inside the loop
             code.writeline(f"{entry.mask_name()} = {entry.name} < {x}numel")

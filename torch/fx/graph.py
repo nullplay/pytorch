@@ -774,8 +774,22 @@ class CodeGen:
                     prev_summary_str = summary_str
                     body.append(summary_str)
 
+        def stringify_dim(x: object) -> str:
+            # Render jagged size symbols (torch.ops.jagged.view) as J(depend_dim), e.g. s1 -> J(0), 128*s1 -> 128*J(0).
+            if isinstance(x, torch.SymInt):
+                jagged = getattr(x.node.shape_env, "jagged_symbols", None)
+                if jagged:
+                    import sympy
+
+                    return str(
+                        x.node.shape_env.simplify(x.node.expr).xreplace(
+                            {s: sympy.Symbol(f"J({d})") for s, (d, _) in jagged.items()}
+                        )
+                    )
+            return str(x)
+
         def stringify_shape(shape: Iterable[object]) -> str:
-            return f"[{', '.join([str(x) for x in shape])}]"
+            return f"[{', '.join([stringify_dim(x) for x in shape])}]"
 
         def emit_node(node: Node) -> None:
             maybe_type_annotation = (
@@ -843,6 +857,8 @@ class CodeGen:
 
                 elif isinstance(meta_val, py_sym_types):
                     val_str = CodeGen._sym_repr(meta_val)
+                    if stringify_dim(meta_val) != str(meta_val):
+                        val_str = stringify_dim(meta_val)
                     maybe_type_annotation = f': "Sym({val_str})"'
 
                 elif isinstance(meta_val, TensorMetadata):

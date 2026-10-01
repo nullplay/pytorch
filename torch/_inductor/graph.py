@@ -546,6 +546,8 @@ class GraphLowering(torch.fx.Interpreter):
         )
 
         self.current_node: torch.fx.Node = None  # type: ignore[assignment]
+        # Jagged size symbol J -> (offsets buffer name, NNZ), filled by the torch.ops.jagged.view lowering.
+        self.jagged: dict[sympy.Symbol, tuple[str, sympy.Expr]] = {}
         self.lists: dict[str, list[str]] = {}
         self.mutated_inputs: OrderedSet[str] = OrderedSet()
         self.mutated_input_idxs: list[int] = []
@@ -1812,6 +1814,10 @@ class GraphLowering(torch.fx.Interpreter):
         )
 
     def finalize(self) -> None:
+        if self.jagged:
+            from .jagged import freeze_jagged_layouts
+
+            freeze_jagged_layouts(self.buffers)
         for buf in self.buffers:
             buf.decide_layout()
 
@@ -2378,6 +2384,8 @@ class GraphLowering(torch.fx.Interpreter):
             V.fake_mode.shape_env.unbacked_renamings.get(s, s)
             for s in unbacked_bindings
         )
+        # A jagged symbol is never a runtime value (each row has its own length), so nothing defines it.
+        renamed_unbacked_bindings -= OrderedSet(self.jagged)
 
         if not (new_unbacked_defs >= renamed_unbacked_bindings):
             raise AssertionError(
@@ -3039,7 +3047,6 @@ class GraphLowering(torch.fx.Interpreter):
         fusion decisions).
         """
         from .scheduler import Scheduler
-
         with config.patch("triton.store_cubin", False):
             self.scheduler = Scheduler(self.operations)
 

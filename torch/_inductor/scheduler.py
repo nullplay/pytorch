@@ -6019,6 +6019,10 @@ class Scheduler:
             # (which is originally used to generate the buffer which the triton kernel writes to)
             self.dead_node_elimination()
 
+        if V.graph.jagged:
+            from .jagged import plan_jagged_kernels
+
+            plan_jagged_kernels(self.nodes)  # per kernel: flatten J with its parent, or a jagged loop over J
         self.merge_loops()
         self.finalize_multi_template_buffers()
         if (

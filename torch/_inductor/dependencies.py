@@ -639,7 +639,15 @@ class _RecordLoadStoreInner(V.MockHandler):  # type: ignore[name-defined]
         }
         return self._normalize(index, var_ranges)
 
+    def _jagged_offsets(self, index: sympy.Expr) -> None:
+        # off[b] inside a jagged index (and off[b + 1] in its ragged loop bound) reads the offsets buffer.
+        if V.graph.jagged:
+            from .jagged import offsets_reads
+
+            self._reads.update(StarDep(name) for name in offsets_reads(index))
+
     def load(self, name: str, index: sympy.Expr) -> None:
+        self._jagged_offsets(index)
         self._reads.add(MemoryDep(name, *self.canonicalize(index)))
 
     def load_seed(self, name: str, index: int) -> None:
@@ -650,12 +658,14 @@ class _RecordLoadStoreInner(V.MockHandler):  # type: ignore[name-defined]
     def store(
         self, name: str, index: sympy.Expr, value: str, mode: str | None = None
     ) -> None:
+        self._jagged_offsets(index)
         self._writes.add(MemoryDep(name, *self.canonicalize(index), mode=mode))
 
     def store_reduction(self, name: str, index: sympy.Expr, value: str) -> None:
         self.store(name, index, f"store_reduction({value})")
 
     def index_expr(self, index: sympy.Expr, dtype: torch.dtype | None) -> None:
+        self._jagged_offsets(index)
         self._index_exprs.add(IndexExprDep(*self.canonicalize(index)))
 
     def value_expr(self, index: sympy.Expr, dtype: torch.dtype | None) -> None:
