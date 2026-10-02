@@ -3047,6 +3047,7 @@ class GraphLowering(torch.fx.Interpreter):
         fusion decisions).
         """
         from .scheduler import Scheduler
+
         with config.patch("triton.store_cubin", False):
             self.scheduler = Scheduler(self.operations)
 

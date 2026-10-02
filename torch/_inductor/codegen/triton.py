@@ -3520,7 +3520,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         if (J := self._jagged_loop_symbol()) is not None:
             from ..jagged import JaggedLoop
 
-            self.jagged = JaggedLoop(self, J)  # emits rnumel itself, once the row of a lane is known
+            # emits rnumel itself, once the row of a lane is known
+            self.jagged = JaggedLoop(self, J)
         elif self.inside_reduction:
             self.codegen_reduction_numels(self.body)
 
@@ -4076,7 +4077,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             from ..jagged import _depend_size
 
             # p0 only: one row per program when the pointwise dims are exactly the rows
-            return V.graph.sizevars.statically_known_equals(self.features.numel, _depend_size(J))
+            return V.graph.sizevars.statically_known_equals(
+                self.features.numel, _depend_size(J)
+            )
         return (
             self.persistent_reduction
             and len(self.numels) == self.num_reduction_dims + 1
@@ -4821,6 +4824,11 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
         index_str = indexing.index_str
         mask_str = indexing.mask_str if indexing.has_mask() else None
+        if upper and getattr(V.graph, "jagged", None):
+            from ..jagged import rewrite_index
+
+            # the length of a jagged row, off[b + 1] - off[b]
+            size = rewrite_index(self, size)
         size_str = texpr(self.rename_indexing(size)) if upper else None
 
         # expr is already wrapped
@@ -8656,7 +8664,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         if self._has_constant_mask(entry):
             code.writeline(self.create_constant_mask(entry))
         elif self._is_jagged_tree(entry):
-            code.writeline(f"{entry.mask_name()} = {entry.name} < {self.jagged.mask_bound()}")
+            code.writeline(
+                f"{entry.mask_name()} = {entry.name} < {self.jagged.mask_bound()}"
+            )
         elif not (x == "x" and self.mix_order_reduction):
             # mix order reduction should generate xmask inside the loop
             code.writeline(f"{entry.mask_name()} = {entry.name} < {x}numel")

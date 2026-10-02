@@ -777,12 +777,13 @@ class CodeGen:
         def stringify_dim(x: object) -> str:
             # Render jagged size symbols (torch.ops.jagged.view) as J(depend_dim), e.g. s1 -> J(0), 128*s1 -> 128*J(0).
             if isinstance(x, torch.SymInt):
-                jagged = getattr(x.node.shape_env, "jagged_symbols", None)
-                if jagged:
+                shape_env = x.node.shape_env
+                jagged = getattr(shape_env, "jagged_symbols", None)
+                if shape_env is not None and jagged:
                     import sympy
 
                     return str(
-                        x.node.shape_env.simplify(x.node.expr).xreplace(
+                        shape_env.simplify(x.node.expr).xreplace(
                             {s: sympy.Symbol(f"J({d})") for s, (d, _) in jagged.items()}
                         )
                     )

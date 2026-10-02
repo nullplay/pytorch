@@ -9889,8 +9889,7 @@ from . import kernel
 
 import_submodule(kernel)
 
-from . import (  # noqa: F401  jagged registers torch.ops.jagged.{view,values} lowerings on import
-    jagged,
+from . import (
     jagged_lowerings,
     mkldnn_lowerings,  # noqa: F401  # registers oneDNN fusion ops on import
     quantized_lowerings,
@@ -9900,6 +9899,8 @@ from . import (  # noqa: F401  jagged registers torch.ops.jagged.{view,values} l
 jagged_lowerings.register_jagged_ops()
 quantized_lowerings.register_quantized_ops()
 quantized_lowerings.register_woq_mm_ops()
+
+from . import jagged  # noqa: F401  # registers torch.ops.jagged lowerings
 
 
 @contextlib.contextmanager

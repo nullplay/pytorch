@@ -716,7 +716,11 @@ class ComboKernel(Kernel):
                 code.writeline(f"{lhs_name} = {int(simplified_tree_numel)}")
                 lhs_names.append(lhs_name)
             else:
-                if f"{tree.prefix}numel_{num}" not in self.dynamic_shape_args:
+                # a jagged tree's numel is defined in-kernel from offsets (jagged.JaggedLoop)
+                if (
+                    f"{tree.prefix}numel_{num}" not in self.dynamic_shape_args
+                    and not sub_kernel._is_jagged_tree(tree)
+                ):
                     raise AssertionError(
                         f"{tree.prefix}numel_{num} not in dynamic_shape_args"
                     )
@@ -1093,6 +1097,8 @@ class ComboKernel(Kernel):
     ) -> list[ArgName]:
         for num, sub_kernel in enumerate(self.sub_kernels):
             for tree in sub_kernel.active_range_trees():
+                if sub_kernel._is_jagged_tree(tree):
+                    continue  # defined in-kernel from offsets
                 if not isinstance(tree.numel, (Integer, int)):
                     # only if it is a dynamic shape
                     sizearg = SizeArg(f"{tree.prefix}numel_{num}", tree.numel)

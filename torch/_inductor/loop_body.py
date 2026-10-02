@@ -580,8 +580,10 @@ class LoopBody:
 
     def bind_set_indirect_shim(self, var, size, check, wrap_neg):
         def set_indirect(new_var):
+            # size may name an indexing expr: a bound that depends on the loop indices
+            bound = self.get_index(size) if isinstance(size, str) else size
             self.replace_indirect(
-                var, V.ops.indirect_indexing(new_var, size, check, wrap_neg)
+                var, V.ops.indirect_indexing(new_var, bound, check, wrap_neg)
             )
 
         set_indirect.clone = functools.partial(  # type: ignore[attr-defined]
@@ -887,6 +889,11 @@ class CaptureIndexing(WrapperHandler):
         """
 
         var = self.body.add_indirect(size)
+        if (
+            isinstance(size, sympy.Expr)
+            and size.free_symbols & self.body.var_ranges.keys()
+        ):
+            size = self.body.add_index_expr(size, MemoryUsageType.CHECK_BOUNDS)
         set_indirect = self.body.bind_set_indirect_shim(var, size, check, wrap_neg)
         self.tracer.create_proxy(
             "call_module",

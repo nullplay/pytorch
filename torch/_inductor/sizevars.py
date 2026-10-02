@@ -510,9 +510,12 @@ class SizeVarAllocator:
                 # remove dim
                 sizes[i] = None
 
+        jagged = V.graph.jagged.keys()
+
         def can_merge_dims(a, b):
-            if V.graph.jagged and V.graph.jagged.keys() & (sizes[a] * sizes[b]).free_symbols:
-                return False  # a jagged dim stays its own loop (flattened with its parent, or a jagged loop)
+            # a jagged dim stays its own loop (flattened with its parent, or a jagged loop)
+            if jagged and jagged & (sizes[a] * sizes[b]).free_symbols:
+                return False
             for k in range(len(strides)):
                 if self.simplify(strides[k][a] * sizes[a]) == self.simplify(
                     strides[k][b]

@@ -1174,7 +1174,8 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
         if getattr(V.graph, "jagged", None):
             from ..jagged import rewrite_index
 
-            index = rewrite_index(self, index)  # off[b] -> load, p0 of packed row -> binary search, before the loop
+            # off[b] -> load, p0 of packed row -> binary search, before the loop
+            index = rewrite_index(self, index)
         index = self.simplify_indexing(index)
         index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)
         # if simple replacements didn't get rid of floor/ceil, try full subs

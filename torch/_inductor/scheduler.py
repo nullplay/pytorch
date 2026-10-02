@@ -48,7 +48,7 @@ from torch._inductor.codecache import LambdaFuture, PyCodeCache
 from torch._inductor.ir import TritonTemplateCallerBase
 from torch._inductor.metrics import get_metric_table, is_metric_table_enabled
 from torch._inductor.stream_utils import get_stream_name
-from torch.fx.experimental.symbolic_shapes import free_symbols
+from torch.fx.experimental.symbolic_shapes import free_symbols, free_unbacked_symbols
 from torch.utils._sympy.functions import FloorDiv, Identity
 from torch.utils._sympy.symbol import free_symbol_is_type, symbol_is_type, SymT
 from torch.utils._triton import has_triton
@@ -6022,7 +6022,8 @@ class Scheduler:
         if V.graph.jagged:
             from .jagged import plan_jagged_kernels
 
-            plan_jagged_kernels(self.nodes)  # per kernel: flatten J with its parent, or a jagged loop over J
+            # per kernel: flatten J with its parent, or a jagged loop over J
+            plan_jagged_kernels(self.nodes)
         self.merge_loops()
         self.finalize_multi_template_buffers()
         if (
@@ -6523,8 +6524,11 @@ class Scheduler:
                 NodeUser(user_node, can_inplace, is_weak)
             )
 
+        # a jagged symbol is never a runtime value (each row has its own length), so nothing defines it
         # pyrefly: ignore [not-a-type, unsupported-operation]
-        unbacked_symbol_to_origin_node: dict[sympy.Symbol, str | None] = {}
+        unbacked_symbol_to_origin_node: dict[sympy.Symbol, str | None] = dict.fromkeys(
+            V.graph.jagged
+        )
 
         # NB: None means that the dependency is on an input.  Don't actually
         # generate a dependency because if we do, Inductor will start trying
@@ -6567,10 +6571,11 @@ class Scheduler:
                 if node.node is None:
                     raise AssertionError("expected node.node to be set")
 
-                unbacked_symbol_uses = sorted(
-                    node.node.get_free_symbol_uses(unbacked_only=True),
-                    key=lambda x: x.name,
-                )
+                uses = node.node.get_free_symbol_uses(unbacked_only=True)
+                # jagged buffers are packed: nnz long
+                for J in OrderedSet(V.graph.jagged) & uses:
+                    uses |= free_unbacked_symbols(V.graph.jagged[J][1])
+                unbacked_symbol_uses = sorted(uses, key=lambda x: x.name)
                 # if a kernel takes unbacked symints, register dependencies
                 for s in unbacked_symbol_uses:
                     if s not in unbacked_symbol_to_origin_node:
@@ -11957,6 +11962,10 @@ class Scheduler:
             symplified_s = V.graph.sizevars.simplify(s)
             # use free_symbols only when s is simplified to an Integer or expr
             res.update(symplified_s.free_symbols)
+        # a jagged symbol has no runtime value (kernels read row lengths from offsets); its buffers are packed, nnz long
+        for J in OrderedSet(V.graph.jagged) & res:
+            res.update(sympy.sympify(V.graph.jagged[J][1]).free_symbols)
+        res -= OrderedSet(V.graph.jagged)
 
         return OrderedSet(sorted(res, key=operator.attrgetter("name")))
 
