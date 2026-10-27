@@ -2831,20 +2831,19 @@ class SIMDScheduling(BaseScheduling):
             helion_matmuls
             and (node1.get_buffer_names() | node2.get_buffer_names()) & helion_matmuls
         ):
-            # SIMD fusion checks may swap producer/consumer to put reductions last.
-            matmul, other = (
-                (node1, node2)
-                if node1.get_buffer_names() & helion_matmuls
-                else (node2, node1)
+            operand_names = OrderedSet(
+                operand.get_name()
+                for name in (node1.get_buffer_names() | node2.get_buffer_names())
+                & helion_matmuls
+                for operand in V.graph.helion_matmul_inputs[name]
             )
-            if other.is_reduction() or not any(
-                dep.name in matmul.get_buffer_names() for dep in other.read_writes.reads
-            ):
+            if (node1.get_buffer_names() | node2.get_buffer_names()) & operand_names:
                 # (a + 1) @ b: keep the addition in the input producer kernel.
-                # relu(a @ b): allow relu to run after dot in the MM kernel.
                 # Metadata views have no producer kernel to fuse.
-                why("Helion matmul preview only supports pointwise epilogues")
+                why("Helion matmul preview does not support input producer fusion")
                 return False
+            # (a @ b) + (c @ d): allow two dots, then their shared epilogue.
+            # Unrelated pointwise work may also fuse if the usual SIMD checks pass.
 
         if isinstance(node1, scheduler.FusedNestedReductions):
             # The scheduler already validated this vertical append. The normal

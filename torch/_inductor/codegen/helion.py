@@ -9,14 +9,16 @@ import sympy
 
 import torch
 from torch.utils._ordered_set import OrderedSet
+from torch.utils._sympy.functions import FloorDiv, ModularIndexing
 
 from .. import config
-from ..ir import IRNode, MutableBox, ReinterpretView
+from ..ir import IRNode, MutableBox, MutationLayoutSHOULDREMOVE, ReinterpretView
 from ..ops_handler import DefaultHandler
 from ..scheduler import SchedulerNode
 from ..sizevars import SimplifyIndexing
 from ..utils import IndentedBuffer
 from ..virtualized import V
+from .common import PythonPrinter
 from .simd import SIMDKernel
 from .simd_kernel_features import DisableReduction, EnableReduction, SIMDKernelFeatures
 
@@ -38,59 +40,63 @@ class HelionTensorArg:
 
 
 class HelionKernel(DefaultHandler):
-    """Emit a source-only preview of one 2D matmul and pointwise epilogues."""
+    """Emit a source-only preview of MM/BMM schedules and pointwise epilogues."""
 
     def __init__(
         self, features: SIMDKernelFeatures, tiling: dict[str, sympy.Expr]
     ) -> None:
-        if tuple(tiling) != ("y", "x", "r0_") or not all(
+        if tuple(tiling) not in (("y", "x", "r0_"), ("z", "y", "x", "r0_")) or not all(
             isinstance(size, sympy.Integer) for size in tiling.values()
         ):
-            raise NotImplementedError("Helion preview requires a static 2D matmul")
-        if features.op_counts().get("dot", 0) != 1:
-            raise NotImplementedError("Helion preview requires a single matmul")
+            raise NotImplementedError("Helion preview requires static MM/BMM tiling")
         if not config.triton.codegen_upcast_to_fp32:
             raise NotImplementedError("Helion preview requires FP32 compute upcasting")
-        if features.get_mutations():
-            raise NotImplementedError("Helion preview does not support mutations")
         nodes = tuple(features.scheduler_nodes())
-        matmuls = [
-            V.graph.helion_matmul_inputs[name]
+        self.matmul_inputs = {
+            name: V.graph.helion_matmul_inputs[name]
             for node in nodes
             for name in node.get_buffer_names()
             if name in V.graph.helion_matmul_inputs
-        ]
-        if len(matmuls) != 1:
-            raise NotImplementedError("Helion preview requires lowered MM operands")
-        self.matmul_inputs = matmuls[0]
+        }
+        if len(self.matmul_inputs) != features.op_counts().get("dot", 0):
+            raise NotImplementedError("Helion preview requires lowered MM/BMM operands")
         if any(
-            operand.get_dtype() not in (torch.float16, torch.bfloat16)
-            for operand in self.matmul_inputs
+            operand.get_dtype() not in (torch.float16, torch.bfloat16, torch.float32)
+            for operands in self.matmul_inputs.values()
+            for operand in operands
         ):
-            raise NotImplementedError("Helion preview supports FP16/BF16 matmul")
+            raise NotImplementedError("Helion preview supports FP16/BF16/FP32 matmul")
         self.features = features
         self.tiling = tiling
-        self.symbols = dict(
-            zip(tiling, sympy.symbols("helion_y helion_x helion_r", integer=True))
-        )
-        self.tiles = {"y": "tile_y", "x": "tile_x", "r0_": "tile_r"}
+        self.outer_axes = tuple(tiling)[:-1]
+        self.symbols = {
+            axis: sympy.Symbol(f"helion_{axis}", integer=True) for axis in tiling
+        }
+        self.tiles = {"z": "tile_z", "y": "tile_y", "x": "tile_x", "r0_": "tile_r"}
+        self.accumulators = {
+            name: "acc" if number == 0 else f"acc{number}"
+            for number, name in enumerate(self.matmul_inputs)
+        }
+        self.current_matmul: str | None = None
         self.inputs: OrderedSet[str] = OrderedSet()
         fused_names = OrderedSet(node.get_name() for node in nodes)
         self.outputs = OrderedSet(
             output.get_name()
             for node in nodes
             for output in node.get_outputs()
-            if not V.graph.scheduler.can_buffer_be_removed_through_fusion(
+            if not isinstance(output.node.get_layout(), MutationLayoutSHOULDREMOVE)
+            and not V.graph.scheduler.can_buffer_be_removed_through_fusion(
                 output.get_name(), fused_names
             )
         )
         self.arguments: dict[tuple[Any, ...], HelionTensorArg] = {}
         self.store_forwarding: dict[tuple[str, sympy.Expr], HelionValue] = {}
+        self.indirect_indices: dict[sympy.Symbol, HelionValue] = {}
         self.reduction_body = IndentedBuffer()
         self.epilogue = IndentedBuffer()
         self.body = self.reduction_body
         self.counter = itertools.count()
-        self.has_dot = False
+        self.dots_emitted: OrderedSet[str] = OrderedSet()
 
     @staticmethod
     def compute_dtype(dtype: torch.dtype) -> torch.dtype:
@@ -116,7 +122,8 @@ class HelionKernel(DefaultHandler):
         )
         result = value.name
         if order != value.depending_indices:
-            result += ".T"
+            permutation = [value.depending_indices.index(axis) for axis in order]
+            result += f".permute({', '.join(map(str, permutation))})"
         if len(depending_indices) != len(value.depending_indices):
             shape = [
                 self.tiles[axis] if axis in value.depending_indices else "1"
@@ -145,18 +152,16 @@ class HelionKernel(DefaultHandler):
             self.arguments[key] = HelionTensorArg(alias, operand)
         return self.arguments[key]
 
-    def epilogue_indices(
+    def tensor_indices(
         self, operand: IRNode, index: sympy.Expr
     ) -> tuple[list[str], tuple[str, ...]]:
         layout = operand.get_layout()
-        if len(layout.size) not in (1, 2):
-            raise NotImplementedError("Helion epilogues require 1D/2D tensor inputs")
         # For shape (M, N), stride (N, 1), match N*y + x to [tile_y, tile_x].
         # A bias with shape (N,) and index x becomes bias[tile_x].
         candidates = [
             [
                 axis
-                for axis in ("y", "x")
+                for axis in self.outer_axes
                 if V.graph.sizevars.statically_known_equals(size, self.tiling[axis])
             ]
             + ([None] if size == 1 else [])
@@ -173,25 +178,116 @@ class HelionKernel(DefaultHandler):
             )
             if V.graph.sizevars.statically_known_equals(index, expected):
                 return (
-                    [self.tiles[axis] if axis is not None else "0" for axis in axes],
+                    [self.tiles[axis] if axis is not None else "0" for axis in axes]
+                    or ["()"],
                     active,
                 )
-        raise NotImplementedError(f"Unsupported Helion epilogue indexing: {index}")
+        # A flattened MM row y can address a 3D output as [y//M, y%M, x].
+        # Decode the existing layout; keep ordinary Tile loads above for TMA.
+        order = sorted(range(len(layout.size)), key=lambda dim: layout.stride[dim])
+        span = 1
+        for dim in order:
+            size, stride = layout.size[dim], layout.stride[dim]
+            if not isinstance(size, (int, sympy.Integer)) or not isinstance(
+                stride, (int, sympy.Integer)
+            ):
+                raise NotImplementedError("Helion indexing requires static layouts")
+            if size == 1:
+                continue
+            if stride < span:
+                raise NotImplementedError(
+                    "Helion indexing requires nonoverlapping strides"
+                )
+            span += (size - 1) * stride
+        offset = index - layout.offset
+        coordinates = []
+        var_ranges = dict(zip(self.symbols.values(), self.tiling.values()))
+        for dim, (size, stride) in enumerate(zip(layout.size, layout.stride)):
+            coordinate = FloorDiv(offset, stride)
+            if dim != order[-1]:
+                # Mod drops whole rows, including negative indirect row indices.
+                coordinate = sympy.Mod(coordinate, size).replace(
+                    sympy.Mod, lambda base, modulus: ModularIndexing(base, 1, modulus)
+                )
+            coordinates.append(
+                sympy.S.Zero
+                if size == 1
+                else V.graph.sizevars.simplify_with_ranges(coordinate, var_ranges)
+            )
+        restored = sum(
+            coord * stride for coord, stride in zip(coordinates, layout.stride)
+        )
+        if V.graph.sizevars.simplify_with_ranges(restored - offset, var_ranges) != 0:
+            raise NotImplementedError(f"Cannot recover Helion tensor indices: {index}")
+        symbols = OrderedSet().union(*(coord.free_symbols for coord in coordinates))
+        axes = tuple(
+            axis
+            for axis in self.outer_axes
+            if self.symbols[axis] in symbols
+            or any(
+                axis in self.indirect_indices[symbol].depending_indices
+                for symbol in symbols
+                if symbol in self.indirect_indices
+            )
+        )
+        replacements = {
+            symbol: sympy.Symbol(
+                self.align(HelionValue(f"{self.tiles[axis]}.index", (axis,)), axes)
+            )
+            for axis, symbol in self.symbols.items()
+            if symbol in symbols
+        }
+        replacements.update(
+            {
+                symbol: sympy.Symbol(self.align(value, axes))
+                for symbol, value in self.indirect_indices.items()
+                if symbol in symbols
+            }
+        )
+        if symbols - replacements.keys():
+            raise NotImplementedError(f"Unsupported Helion indexing: {index}")
+        printer = PythonPrinter()
+        return [
+            printer.doprint(coord.xreplace(replacements), simplify=False)
+            for coord in coordinates
+        ], axes
+
+    def indirect_indexing(
+        self,
+        value: HelionValue,
+        size: sympy.Expr,
+        check: bool = True,
+        wrap_neg: bool = True,
+    ) -> sympy.Symbol:
+        # out.index_add_(0, indices, acc) becomes hl.atomic_add(out, [indices, x], acc).
+        # Helion's tensor indexing handles negative-index wrapping.
+        # For wrap_neg=False, this preview assumes valid nonnegative indices;
+        # it does not yet emit Inductor's runtime index checks.
+        symbol = sympy.Symbol(
+            f"helion_indirect{len(self.indirect_indices)}", integer=True
+        )
+        self.indirect_indices[symbol] = value
+        return symbol
 
     def load(self, name: str, index: sympy.Expr) -> HelionValue:
         index = sympy.sympify(index)
         if (name, index) in self.store_forwarding:
             return self.store_forwarding[name, index]
-        if self.body is self.reduction_body:
+        if self.current_matmul is not None:
+            operands = self.matmul_inputs[self.current_matmul]
+            number = tuple(self.matmul_inputs).index(self.current_matmul)
+            batch = ("z",) if "z" in self.tiling else ()
             for operand, axes, alias in (
-                (self.matmul_inputs[0], ("y", "r0_"), "A"),
-                (self.matmul_inputs[1], ("r0_", "x"), "B"),
+                (operands[0], (*batch, "y", "r0_"), "A"),
+                (operands[1], (*batch, "r0_", "x"), "B"),
             ):
                 if operand.get_name() != name:
                     continue
                 expected = operand.make_indexer()([self.symbols[axis] for axis in axes])
                 if V.graph.sizevars.statically_known_equals(index, expected):
-                    argument = self.tensor_arg(operand, alias)
+                    argument = self.tensor_arg(
+                        operand, alias + (str(number) if number else "")
+                    )
                     self.inputs.add(name)
                     coordinates = ", ".join(self.tiles[axis] for axis in axes)
                     dtype = self.compute_dtype(operand.get_dtype())
@@ -200,7 +296,7 @@ class HelionKernel(DefaultHandler):
                     )
             raise NotImplementedError("Helion preview does not support fused prologues")
         operand = V.graph.get_buffer(name)
-        coordinates, axes = self.epilogue_indices(operand, index)
+        coordinates, axes = self.tensor_indices(operand, index)
         argument = self.tensor_arg(operand)
         self.inputs.add(name)
         dtype = self.compute_dtype(operand.get_dtype())
@@ -226,18 +322,18 @@ class HelionKernel(DefaultHandler):
         return self.emit(f"{value.name}.to({dtype})", value.depending_indices)
 
     def dot(self, lhs: HelionValue, rhs: HelionValue) -> HelionValue:
-        if self.has_dot:
-            raise NotImplementedError("Helion preview supports one dot reduction")
-        self.has_dot = True
-        operands = []
-        for value, depending_indices in [(lhs, ("y", "r0_")), (rhs, ("r0_", "x"))]:
-            operand = self.align(value, depending_indices)
-            if len(value.depending_indices) != len(depending_indices):
-                shape = ", ".join(self.tiles[axis] for axis in depending_indices)
-                operand += f".expand([{shape}])"
-            operands.append(operand)
-        self.body.writeline(f"acc = hl.dot({operands[0]}, {operands[1]}, acc=acc)")
-        return HelionValue("acc", ("y", "x"))
+        name = self.current_matmul
+        if name is None or name in self.dots_emitted:
+            raise NotImplementedError("Helion dot must belong to a lowered MM/BMM node")
+        self.dots_emitted.add(name)
+        batch = ("z",) if "z" in self.tiling else ()
+        left = self.align(lhs, (*batch, "y", "r0_"))
+        right = self.align(rhs, (*batch, "r0_", "x"))
+        acc = self.accumulators[name]
+        # Horizontal fusion needs one accumulator per MM, not one shared sum.
+        op = "baddbmm" if batch else "addmm"
+        self.body.writeline(f"{acc} = torch.{op}({acc}, {left}, {right})")
+        return HelionValue(acc, self.outer_axes)
 
     def reduction(
         self,
@@ -257,12 +353,33 @@ class HelionKernel(DefaultHandler):
         value: HelionValue,
         mode: str | None = None,
     ) -> None:
-        if mode is not None:
-            raise NotImplementedError("Helion preview does not support atomic stores")
+        if mode not in (None, "atomic_add"):
+            raise NotImplementedError(f"Unsupported Helion store mode: {mode}")
+        operand = V.graph.get_buffer(name)
+        layout = operand.get_layout()
+        if isinstance(layout, MutationLayoutSHOULDREMOVE):
+            if mode is None:
+                raise NotImplementedError(
+                    "Helion preview supports atomic_add mutations"
+                )
+            operand = layout.target
+            self.inputs.add(operand.get_name())
+        if mode == "atomic_add":
+            if operand.get_dtype() == torch.bool:
+                raise NotImplementedError(
+                    "Helion preview does not support bool atomic stores"
+                )
+            coordinates, axes = self.tensor_indices(operand, index)
+            argument = self.tensor_arg(operand)
+            stored = self.align(value, axes)
+            self.epilogue.writeline(
+                f"hl.atomic_add({argument.name}, [{', '.join(coordinates)}], "
+                f"{stored}.to({operand.get_dtype()}))"
+            )
+            return
         self.store_forwarding[name, sympy.sympify(index)] = value
         if name in self.outputs:
-            operand = V.graph.get_buffer(name)
-            coordinates, axes = self.epilogue_indices(operand, index)
+            coordinates, axes = self.tensor_indices(operand, index)
             argument = self.tensor_arg(operand)
             stored = self.align(value, axes)
             self.epilogue.writeline(
@@ -290,11 +407,17 @@ class HelionKernel(DefaultHandler):
         raise NotImplementedError(f"Unsupported Helion preview op: {name}")
 
     def codegen_kernel(self) -> str:
+        """Replay the SIMD schedule and emit the kernel plus its metadata-view caller."""
+
         def set_ranges(*ranges):
-            if any(len(sizes) > 1 for sizes in ranges):
-                raise NotImplementedError("Helion preview cannot split a logical axis")
+            # SIMD may split y into batch/row: y//M and y%M, without another loop.
             return [
-                [symbol] if sizes else []
+                [
+                    FloorDiv(symbol, math.prod(sizes[dim + 1 :]))
+                    if dim == 0
+                    else ModularIndexing(symbol, math.prod(sizes[dim + 1 :]), size)
+                    for dim, size in enumerate(sizes)
+                ]
                 for symbol, sizes in zip(self.symbols.values(), ranges)
             ]
 
@@ -306,6 +429,14 @@ class HelionKernel(DefaultHandler):
                 self.body = self.reduction_body
             else:
                 node = cast(SchedulerNode, node)
+                self.current_matmul = next(
+                    (
+                        name
+                        for name in node.get_buffer_names()
+                        if name in self.matmul_inputs
+                    ),
+                    None,
+                )
                 groups = list(self.tiling.values())
                 if self.body is self.epilogue:
                     groups[-1] = sympy.S.One
@@ -333,11 +464,12 @@ class HelionKernel(DefaultHandler):
         signature = ", ".join(f"{arg.name}: torch.Tensor" for arg in tensor_args)
         code.writeline(f"def {name}({signature}) -> None:")
         with code.indent():
-            code.writeline(
-                f"for tile_y, tile_x in hl.tile([{self.tiling['y']}, {self.tiling['x']}]):"
-            )
+            tiles = ", ".join(self.tiles[axis] for axis in self.outer_axes)
+            sizes = ", ".join(str(self.tiling[axis]) for axis in self.outer_axes)
+            code.writeline(f"for {tiles} in hl.tile([{sizes}]):")
             with code.indent():
-                code.writeline("acc = hl.zeros([tile_y, tile_x], dtype=torch.float32)")
+                for acc in self.accumulators.values():
+                    code.writeline(f"{acc} = hl.zeros([{tiles}], dtype=torch.float32)")
                 code.writeline(f"for tile_r in hl.tile({self.tiling['r0_']}):")
                 with code.indent():
                     code.splice(self.reduction_body)

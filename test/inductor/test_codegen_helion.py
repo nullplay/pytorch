@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 import torch
 from torch._inductor import config
 from torch._inductor.codegen.triton import TritonScheduling
+from torch._inductor.decomposition import select_decomp_table
 from torch._inductor.graph import GraphLowering
 from torch._inductor.virtualized import V
 from torch._subclasses.fake_tensor import FakeTensorMode
@@ -32,7 +33,16 @@ class TestHelionCodegen(TestCase):
     hw_classification = HardwareClassification.CUDA
 
     def codegen(
-        self, fn, shapes, *, strides=None, dtypes=None, helion_code=True, schedules=None
+        self,
+        fn,
+        shapes,
+        *,
+        strides=None,
+        dtypes=None,
+        helion_code=True,
+        schedules=None,
+        decompose=False,
+        complete=False,
     ):
         fake_mode = FakeTensorMode(allow_fallback_kernels=False)
         with fake_mode:
@@ -46,7 +56,11 @@ class TestHelionCodegen(TestCase):
                     dtypes or [torch.bfloat16] * len(shapes),
                 )
             ]
-            gm = make_fx(fn, tracing_mode="fake")(*inputs)
+            gm = make_fx(
+                fn,
+                decomposition_table=select_decomp_table() if decompose else None,
+                tracing_mode="fake",
+            )(*inputs)
         debug = Mock()
         with (
             config.patch(
@@ -76,7 +90,11 @@ class TestHelionCodegen(TestCase):
                         features.is_native_matmul()
                         schedules.append(features)
                     if features.is_native_matmul():
-                        return codegen_schedule(scheduling, features)
+                        try:
+                            return codegen_schedule(scheduling, features)
+                        except CodegenComplete:
+                            if not complete:
+                                raise
                     for node in features.scheduler_nodes():
                         node.mark_run()
 
@@ -103,7 +121,7 @@ class TestHelionCodegen(TestCase):
         )
         self.assertIn("A[tile_y, tile_r]", source)
         self.assertIn("B[tile_r, tile_x]", source)
-        self.assertIn("acc = hl.dot(tmp1, tmp3, acc=acc)", source)
+        self.assertIn("acc = torch.addmm(acc, tmp1, tmp3)", source)
         self.assertIn("out0[tile_y, tile_x] = acc.to(", source)
         self.assertIn("helion_op0(a_1, b_1, buf0)", source)
         self.assertNotIn("reinterpret_tensor", source)
@@ -278,6 +296,144 @@ class TestHelionCodegen(TestCase):
 
     def test_pointwise_not_selected(self):
         self.assertEqual(self.codegen(lambda a: a + 1, [(40, 72)]), [])
+
+    @parametrize("epilogue", [False, True])
+    def test_horizontal_mm(self, epilogue):
+        def fn(a, b, c, d):
+            first, second = a @ b, c @ d
+            # Shared A makes this a horizontal candidate under the usual scheduler rules.
+            return (
+                torch.relu(first - second + first * second)
+                if epilogue
+                else (first, a @ d)
+            )
+
+        schedules = []
+        (source,) = self.codegen(fn, [(40, 72), (72, 136)] * 2, schedules=schedules)
+        self.assertEqual(len(schedules), 1)
+        self.assertEqual(source.count(" = torch.addmm("), 2)
+        self.assertIn("acc1 = hl.zeros(", source)
+        self.assertIn("B1[tile_r, tile_x]", source)
+        if epilogue:
+            self.assertIn("A1[tile_y, tile_r]", source)
+            self.assertIn("acc - acc1", source)
+            self.assertIn("acc * acc1", source)
+            self.assertIn("torch.relu(", source)
+
+    def test_horizontal_then_epilogue_chain(self):
+        (source,) = self.codegen(
+            lambda a, b, c, d, e, f: torch.relu(a @ b + c @ d + e @ f),
+            [(40, 72), (72, 136)] * 3,
+        )
+        self.assertEqual(source.count(" = torch.addmm("), 3)
+        self.assertIn("acc2 = hl.zeros(", source)
+        self.assertIn("torch.relu(", source)
+
+    @parametrize("horizontal", [False, True])
+    def test_bmm_epilogue(self, horizontal):
+        def fn(a, b, c, d, bias):
+            first = torch.bmm(a, b)
+            result = first - torch.bmm(c, d) if horizontal else first
+            return torch.relu(result) + first * first + bias
+
+        schedules = []
+        (source,) = self.codegen(
+            fn,
+            [(3, 40, 72), (3, 72, 136)] * 2 + [(136,)],
+            schedules=schedules,
+        )
+        self.assertEqual(len(schedules), 1)
+        self.assertIn("for tile_z, tile_y, tile_x in hl.tile([3, 40, 136]):", source)
+        self.assertIn("A[tile_z, tile_y, tile_r]", source)
+        self.assertIn("B[tile_z, tile_r, tile_x]", source)
+        self.assertIn("out0[tile_z, tile_y, tile_x]", source)
+        self.assertEqual(source.count(" = torch.baddbmm("), 2 if horizontal else 1)
+
+    def test_bmm_operand_view(self):
+        (source,) = self.codegen(
+            lambda a, bt: torch.bmm(a.reshape(3, 40, 72), bt.permute(0, 2, 1)),
+            [(3, 40, 9, 8), (3, 136, 72)],
+        )
+        self.assertIn("reinterpret_tensor(a_1, (3, 40, 72), (2880, 72, 1), 0)", source)
+        self.assertIn(
+            "reinterpret_tensor(bt_1, (3, 72, 136), (9792, 1, 72), 0)", source
+        )
+        self.assertNotIn("//", source)
+        self.assertNotIn("%", source)
+
+    def test_fp32(self):
+        (source,) = self.codegen(
+            lambda a, b: a @ b,
+            [(40, 72), (72, 136)],
+            dtypes=[torch.float32, torch.float32],
+        )
+        self.assertIn("acc = torch.addmm(acc, tmp0, tmp1)", source)
+
+    @parametrize("batched", [False, True])
+    def test_atomic_add_epilogue(self, batched):
+        def fn(a, b, indices, out):
+            value = torch.bmm(a, b) if batched else a @ b
+            out.index_add_(0, indices, value)
+            return out
+
+        shapes = (
+            [(3, 40, 72), (3, 72, 136), (3,), (7, 40, 136)]
+            if batched
+            else [(40, 72), (72, 136), (40,), (80, 136)]
+        )
+        (source,) = self.codegen(
+            fn,
+            shapes,
+            dtypes=[torch.float32, torch.float32, torch.int64, torch.float32],
+            decompose=True,
+            complete=True,
+        )
+        self.assertIn("hl.atomic_add(", source)
+        self.assertIn("out_1", source)
+        self.assertIn("acc", source)
+
+    def test_gather_mm_broadcast_epilogue(self):
+        # The normal memory heuristic can reject this fusion after input realization.
+        # Bypass only that heuristic to check the legal fused schedule's codegen.
+        with patch(
+            "torch._inductor.scheduler.Scheduler.can_fusion_increase_peak_memory",
+            return_value=False,
+        ):
+            (source,) = self.codegen(
+                lambda x, y, z, w: x[z] @ y + w + 3,
+                [(128, 128)] * 4,
+                dtypes=[torch.float32, torch.float32, torch.int64, torch.float32],
+                decompose=True,
+                complete=True,
+            )
+        self.assertIn("torch.addmm(", source)
+        self.assertIn("in0[", source)
+        self.assertIn("3.0", source)
+        self.assertIn("% 128", source)
+
+    def test_scalar_tensor_epilogue(self):
+        (source,) = self.codegen(
+            lambda a, b, bias: a @ b + bias,
+            [(40, 72), (72, 136), ()],
+        )
+        self.assertIn("in0[()]", source)
+
+    def test_padded_scatter_rejected(self):
+        def fn(a, b, indices, out):
+            out.index_add_(0, indices, a @ b)
+            return out
+
+        with self.assertRaisesRegex(
+            NotImplementedError, "Cannot recover Helion tensor indices"
+        ):
+            self.codegen(
+                fn,
+                [(40, 72), (72, 136), (40,), (80, 136)],
+                strides=[(72, 1), (136, 1), (1,), (144, 1)],
+                dtypes=[torch.float32, torch.float32, torch.int64, torch.float32],
+                decompose=True,
+                complete=True,
+            )
 
     def test_upcast_is_required(self):
         with config.patch("triton.codegen_upcast_to_fp32", False):
