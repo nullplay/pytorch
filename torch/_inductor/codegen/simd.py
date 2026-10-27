@@ -2826,6 +2826,26 @@ class SIMDScheduling(BaseScheduling):
         _, (numel2, rnumel2) = node2.group
         why = WhyNoFuse(node1, node2)
 
+        helion_matmuls = V.graph.helion_matmul_inputs.keys()
+        if (
+            helion_matmuls
+            and (node1.get_buffer_names() | node2.get_buffer_names()) & helion_matmuls
+        ):
+            # SIMD fusion checks may swap producer/consumer to put reductions last.
+            matmul, other = (
+                (node1, node2)
+                if node1.get_buffer_names() & helion_matmuls
+                else (node2, node1)
+            )
+            if other.is_reduction() or not any(
+                dep.name in matmul.get_buffer_names() for dep in other.read_writes.reads
+            ):
+                # (a + 1) @ b: keep the addition in the input producer kernel.
+                # relu(a @ b): allow relu to run after dot in the MM kernel.
+                # Metadata views have no producer kernel to fuse.
+                why("Helion matmul preview only supports pointwise epilogues")
+                return False
+
         if isinstance(node1, scheduler.FusedNestedReductions):
             # The scheduler already validated this vertical append. The normal
             # SIMD ladder cannot represent its two iteration spaces.
