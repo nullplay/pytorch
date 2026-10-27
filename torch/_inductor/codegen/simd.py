@@ -4335,6 +4335,16 @@ class SIMDScheduling(BaseScheduling):
             kernel_features.reduction_numel,
             kernel_features.coalesce_analysis,
         )
+        if config.trace.helion_code and kernel_features.is_native_matmul():
+            from .helion import HelionKernel
+
+            helion_code = HelionKernel(kernel_features, tiling).codegen_kernel()
+            torch._logging.trace_structured(
+                "artifact",
+                metadata_fn=lambda: {"name": "helion_code", "encoding": "string"},
+                payload_fn=lambda: helion_code,
+            )
+            V.debug.helion_code(helion_code)
         kernels = self.create_kernel_choices(
             kernel_features,
             [tiling],
