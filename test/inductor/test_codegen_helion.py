@@ -5,11 +5,15 @@ import ast
 import unittest
 from unittest.mock import Mock, patch
 
+import sympy
+
 import torch
-from torch._inductor import config
+from torch._inductor import config, ir
+from torch._inductor.codegen.helion import HelionKernel
 from torch._inductor.codegen.triton import TritonScheduling
 from torch._inductor.decomposition import select_decomp_table
 from torch._inductor.graph import GraphLowering
+from torch._inductor.sizevars import SizeVarAllocator
 from torch._inductor.virtualized import V
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.experimental.proxy_tensor import make_fx
@@ -139,6 +143,23 @@ class TestHelionCodegen(TestCase):
         self.assertIn("tmp5 = acc + tmp4.reshape([1, tile_x])", source)
         self.assertIn("tmp6 = torch.relu(tmp5)", source)
         self.assertNotIn("hl.load(buf", source)
+
+    @parametrize(
+        "op", [torch.erf, torch.tanh, torch.neg, torch.sigmoid, torch.exp, torch.expm1]
+    )
+    def test_unary_epilogue(self, op):
+        (source,) = self.codegen(lambda a, b: op(a @ b), [(40, 72), (72, 136)])
+        self.assertIn(f"torch.{op.__name__}(", source)
+
+    def test_where_epilogue_broadcast(self):
+        def fn(a, b, bias):
+            result = a @ b
+            return torch.where(result <= bias, result, bias)
+
+        (source,) = self.codegen(fn, [(40, 72), (72, 136), (136,)])
+        self.assertIn(" <= ", source)
+        self.assertIn("torch.where(", source)
+        self.assertIn(".reshape([1, tile_x])", source)
 
     @parametrize("axis", ["row", "column", "matrix"])
     def test_epilogue_broadcast(self, axis):
@@ -328,6 +349,81 @@ class TestHelionCodegen(TestCase):
         self.assertEqual(source.count(" = torch.addmm("), 3)
         self.assertIn("acc2 = hl.zeros(", source)
         self.assertIn("torch.relu(", source)
+
+    @parametrize("batched", [False, True])
+    @parametrize("shared_lhs", [False, True])
+    def test_horizontal_shared_load_cse(self, batched, shared_lhs):
+        def fn(a, b, c):
+            if batched:
+                return (
+                    torch.bmm(a, b) + torch.bmm(a, c)
+                    if shared_lhs
+                    else torch.bmm(a, c) + torch.bmm(b, c)
+                )
+            return a @ b + a @ c if shared_lhs else a @ c + b @ c
+
+        lhs, rhs = (40, 72), (72, 136)
+        shapes = [lhs, rhs, rhs] if shared_lhs else [lhs, lhs, rhs]
+        if batched:
+            shapes = [(3, *shape) for shape in shapes]
+        (source,) = self.codegen(fn, shapes)
+        op = "baddbmm" if batched else "addmm"
+        self.assertEqual(source.count(f" = torch.{op}("), 2)
+        indices = "tile_y, tile_r" if shared_lhs else "tile_r, tile_x"
+        if batched:
+            indices = "tile_z, " + indices
+        argument = "A" if shared_lhs else "B"
+        self.assertEqual(source.count(f"{argument}[{indices}]"), 1)
+
+    def test_horizontal_distinct_operand_views(self):
+        (source,) = self.codegen(
+            lambda a, b: a[:-1] @ b + a[1:] @ b,
+            [(41, 72), (72, 136)],
+        )
+        self.assertEqual(source.count(" = torch.addmm("), 2)
+        self.assertIn("A[tile_y, tile_r]", source)
+        self.assertIn("A1[tile_y, tile_r]", source)
+        self.assertIn("reinterpret_tensor(a_1, (40, 72), (72, 1), 72)", source)
+
+    def test_cse_scopes_and_atomic_invalidation(self):
+        features = Mock()
+        features.scheduler_nodes.return_value = []
+        features.op_counts.return_value = {}
+        kernel = HelionKernel(
+            features,
+            {
+                axis: sympy.Integer(size)
+                for axis, size in zip(("y", "x", "r0_"), (40, 136, 72))
+            },
+        )
+        reduction_value = kernel.constant(1, torch.float32)
+        kernel.body = kernel.epilogue
+        epilogue_value = kernel.constant(1, torch.float32)
+        self.assertNotEqual(reduction_value.name, epilogue_value.name)
+        self.assertIs(kernel.constant(1, torch.float32), epilogue_value)
+
+        graph = Mock(sizevars=SizeVarAllocator())
+        target = ir.InputBuffer(
+            name="buf0",
+            layout=ir.FixedLayout(
+                torch.device("cuda"), torch.float32, [40, 136], [136, 1]
+            ),
+        )
+        with V.set_graph_handler(graph):
+            mutation = ir.Buffer(
+                name="mutation", layout=ir.MutationLayoutSHOULDREMOVE(target)
+            )
+            graph.get_buffer.side_effect = {
+                "buf0": target,
+                "mutation": mutation,
+            }.__getitem__
+            index = 136 * kernel.symbols["y"] + kernel.symbols["x"]
+            before = kernel.load("buf0", index)
+            self.assertIs(kernel.load("buf0", index), before)
+            kernel.store("mutation", index, epilogue_value, mode="atomic_add")
+            self.assertNotEqual(kernel.load("buf0", index).name, before.name)
+        kernel.body = kernel.reduction_body
+        self.assertIs(kernel.constant(1, torch.float32), reduction_value)
 
     @parametrize("horizontal", [False, True])
     def test_bmm_epilogue(self, horizontal):

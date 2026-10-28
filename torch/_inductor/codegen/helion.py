@@ -95,6 +95,10 @@ class HelionKernel(DefaultHandler):
         self.reduction_body = IndentedBuffer()
         self.epilogue = IndentedBuffer()
         self.body = self.reduction_body
+        # A tile_r temporary cannot be reused outside the K loop.
+        self.cse: dict[
+            IndentedBuffer, dict[tuple[str, tuple[str, ...]], HelionValue]
+        ] = {self.reduction_body: {}, self.epilogue: {}}
         self.counter = itertools.count()
         self.dots_emitted: OrderedSet[str] = OrderedSet()
 
@@ -108,9 +112,13 @@ class HelionKernel(DefaultHandler):
         return dtype
 
     def emit(self, expression: str, depending_indices: tuple[str, ...]) -> HelionValue:
-        name = f"tmp{next(self.counter)}"
-        self.body.writeline(f"{name} = {expression}")
-        return HelionValue(name, depending_indices)
+        cache = self.cse[self.body]
+        key = (expression, depending_indices)
+        if key not in cache:
+            name = f"tmp{next(self.counter)}"
+            self.body.writeline(f"{name} = {expression}")
+            cache[key] = HelionValue(name, depending_indices)
+        return cache[key]
 
     def align(self, value: HelionValue, depending_indices: tuple[str, ...]) -> str:
         if not value.depending_indices or value.depending_indices == depending_indices:
@@ -364,6 +372,9 @@ class HelionKernel(DefaultHandler):
                 )
             operand = layout.target
             self.inputs.add(operand.get_name())
+        if mode == "atomic_add" or name in self.outputs:
+            # Physical stores run in the epilogue and may alias cached loads.
+            self.cse[self.epilogue].clear()
         if mode == "atomic_add":
             if operand.get_dtype() == torch.bool:
                 raise NotImplementedError(
@@ -391,19 +402,34 @@ class HelionKernel(DefaultHandler):
         self.store(name, index, value)
 
     def _default(self, name: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
-        binary = {"add": "+", "sub": "-", "mul": "*", "truediv": "/"}
-        if name in binary and not kwargs:
-            lhs, rhs = args
+        binary = {
+            "add": "+",
+            "sub": "-",
+            "mul": "*",
+            "truediv": "/",
+            "eq": "==",
+            "ne": "!=",
+            "lt": "<",
+            "le": "<=",
+            "gt": ">",
+            "ge": ">=",
+        }
+        unary = OrderedSet(["relu", "erf", "tanh", "neg", "sigmoid", "exp", "expm1"])
+        torch_ops = OrderedSet(["where", "minimum", "maximum"])
+        if not kwargs and (name in binary or name in unary or name in torch_ops):
             depending_indices = tuple(
-                dict.fromkeys((*lhs.depending_indices, *rhs.depending_indices))
+                dict.fromkeys(
+                    axis for value in args for axis in value.depending_indices
+                )
             )
-            left = self.align(lhs, depending_indices)
-            right = self.align(rhs, depending_indices)
-            expression = f"{left} {binary[name]} {right}"
+            values = [self.align(value, depending_indices) for value in args]
+            # Torch pointwise ops are lowered by Helion; align the tile axes first.
+            expression = (
+                f"{values[0]} {binary[name]} {values[1]}"
+                if name in binary
+                else f"torch.{name}({', '.join(values)})"
+            )
             return self.emit(expression, depending_indices)
-        if name == "relu" and not kwargs:
-            (value,) = args
-            return self.emit(f"torch.relu({value.name})", value.depending_indices)
         raise NotImplementedError(f"Unsupported Helion preview op: {name}")
 
     def codegen_kernel(self) -> str:
