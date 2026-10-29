@@ -3,16 +3,23 @@ from __future__ import annotations
 import itertools
 import math
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any, cast, TYPE_CHECKING
 
 import sympy
 
 import torch
+from torch._subclasses.fake_impls import _compute_stride
 from torch.utils._ordered_set import OrderedSet
 from torch.utils._sympy.functions import FloorDiv, ModularIndexing
 
 from .. import config
-from ..ir import IRNode, MutableBox, MutationLayoutSHOULDREMOVE, ReinterpretView
+from ..ir import (
+    FixedLayout,
+    IRNode,
+    MutableBox,
+    MutationLayoutSHOULDREMOVE,
+    ReinterpretView,
+)
 from ..ops_handler import DefaultHandler
 from ..scheduler import SchedulerNode
 from ..sizevars import SimplifyIndexing
@@ -21,6 +28,31 @@ from ..virtualized import V
 from .common import PythonPrinter
 from .simd import SIMDKernel
 from .simd_kernel_features import DisableReduction, EnableReduction, SIMDKernelFeatures
+
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+
+class HelionPythonPrinter(PythonPrinter):
+    def _print_min_max(self, expr: sympy.Expr, name: str) -> str:
+        values = []
+        for arg in expr.args:
+            value = self.doprint(arg, simplify=False)
+            if not arg.free_symbols:
+                dtype = torch.int64 if arg.is_integer else torch.float64
+                value = f"hl.full([], {value}, dtype={dtype})"
+            values.append(value)
+        result = values[0]
+        for value in values[1:]:
+            result = f"torch.{name}({result}, {value})"
+        return result
+
+    def _print_Min(self, expr: sympy.Expr) -> str:
+        return self._print_min_max(expr, "minimum")
+
+    def _print_Max(self, expr: sympy.Expr) -> str:
+        return self._print_min_max(expr, "maximum")
 
 
 @dataclass(frozen=True)
@@ -92,6 +124,7 @@ class HelionKernel(DefaultHandler):
         self.arguments: dict[tuple[Any, ...], HelionTensorArg] = {}
         self.store_forwarding: dict[tuple[str, sympy.Expr], HelionValue] = {}
         self.indirect_indices: dict[sympy.Symbol, HelionValue] = {}
+        self.active_mask: HelionValue | None = None
         self.reduction_body = IndentedBuffer()
         self.epilogue = IndentedBuffer()
         self.body = self.reduction_body
@@ -120,7 +153,16 @@ class HelionKernel(DefaultHandler):
             cache[key] = HelionValue(name, depending_indices)
         return cache[key]
 
-    def align(self, value: HelionValue, depending_indices: tuple[str, ...]) -> str:
+    def align(
+        self,
+        value: HelionValue,
+        depending_indices: tuple[str, ...],
+        *,
+        for_index: bool = False,
+    ) -> str:
+        # Pointwise ops broadcast trailing axes: bias[x] + acc[y, x] needs no
+        # reshape, while row[y] needs row.reshape([tile_y, 1]). Tensor index
+        # coordinates need the full rank, e.g. x.reshape([1, 1, tile_x]).
         if not value.depending_indices or value.depending_indices == depending_indices:
             return value.name
         if not OrderedSet(value.depending_indices).issubset(depending_indices):
@@ -132,7 +174,9 @@ class HelionKernel(DefaultHandler):
         if order != value.depending_indices:
             permutation = [value.depending_indices.index(axis) for axis in order]
             result += f".permute({', '.join(map(str, permutation))})"
-        if len(depending_indices) != len(value.depending_indices):
+        if len(order) < len(depending_indices) and (
+            for_index or order != depending_indices[-len(order) :]
+        ):
             shape = [
                 self.tiles[axis] if axis in value.depending_indices else "1"
                 for axis in depending_indices
@@ -140,10 +184,86 @@ class HelionKernel(DefaultHandler):
             result += f".reshape([{', '.join(shape)}])"
         return result
 
-    def tensor_arg(self, operand: IRNode, alias: str | None = None) -> HelionTensorArg:
+    def simplify_index(self, index: sympy.Expr) -> sympy.Expr:
+        # Expose quotient/remainder cancellation before inferring tensor axes:
+        # x % B + B * (x // B) becomes x, so it no longer needs two indices.
+        index = sympy.sympify(index)
+        expanded = index.replace(
+            ModularIndexing,
+            lambda base, divisor, modulus: FloorDiv(base, divisor)
+            - modulus * FloorDiv(base, divisor * modulus),
+        )
+        var_ranges = dict(zip(self.symbols.values(), self.tiling.values()))
+        expanded = sympy.expand(expanded)
+        simplified = V.graph.sizevars.simplify_with_ranges(expanded, var_ranges)
+        # Keep genuine nonlinear maps compact for the fallback index decoder.
+        return index if simplified.has(FloorDiv) else simplified
+
+    def tensor_arg(
+        self,
+        operand: IRNode,
+        alias: str | None = None,
+        *,
+        index: sympy.Expr | None = None,
+    ) -> HelionTensorArg:
         while isinstance(operand, MutableBox):
             operand = operand.data
         layout = operand.get_layout()
+        if index is not None:
+            # Drop constant singleton coordinates through a caller view:
+            # input[g, 0, y, x] becomes input_squeezed[g, y, x]. Keeping the
+            # unused dimension can change Helion's advanced-index result rank.
+            active = [dim for dim, size in enumerate(layout.size) if size != 1]
+            if len(active) != len(layout.size):
+                layout = FixedLayout(
+                    layout.device,
+                    layout.dtype,
+                    [layout.size[dim] for dim in active],
+                    [layout.stride[dim] for dim in active],
+                    layout.offset,
+                    layout.is_pinned,
+                )
+                operand = ReinterpretView(data=operand, layout=layout)
+            # Recover a view from the linear address, not the original rank.
+            # For N*y + x, a contiguous (B, M, N) buffer can be passed as
+            # reinterpret_tensor(buffer, (B*M, N), (N, 1), 0), then indexed
+            # inside the kernel as buffer[tile_y, tile_x].
+            symbols = index.free_symbols
+            axes = tuple(
+                axis for axis in self.outer_axes if self.symbols[axis] in symbols
+            )
+            old_size, old_stride = list(layout.size), list(layout.stride)
+            size = [self.tiling[axis] for axis in axes]
+            expression = sympy.expand(index)
+            stride = [expression.coeff(self.symbols[axis]) for axis in axes]
+            expected = layout.offset + sum(
+                self.symbols[axis] * s for axis, s in zip(axes, stride)
+            )
+            integers = (*old_size, *old_stride, *stride)
+            if (
+                all(isinstance(v, (int, sympy.Integer)) for v in integers)
+                and math.prod(size) == math.prod(old_size)
+                and (size != old_size or stride != old_stride)
+                and V.graph.sizevars.statically_known_equals(index, expected)
+            ):
+                # Match storage chunks independently of the logical dimension order.
+                old_order = sorted(range(len(old_size)), key=lambda d: -old_stride[d])
+                new_order = sorted(range(len(size)), key=lambda d: -stride[d])
+                view_stride = _compute_stride(
+                    [int(old_size[d]) for d in old_order],
+                    [int(old_stride[d]) for d in old_order],
+                    [int(size[d]) for d in new_order],
+                )
+                if view_stride == [stride[d] for d in new_order]:
+                    layout = FixedLayout(
+                        layout.device,
+                        layout.dtype,
+                        size,
+                        stride,
+                        layout.offset,
+                        layout.is_pinned,
+                    )
+                    operand = ReinterpretView(data=operand, layout=layout)
         key = (
             operand.get_name(),
             tuple(layout.size),
@@ -239,22 +359,28 @@ class HelionKernel(DefaultHandler):
             )
         )
         replacements = {
+            # All explicit coordinates share one broadcast rank. For [z, y, x],
+            # use z[:, None, None], y[None, :, None], and x[None, None, :].
             symbol: sympy.Symbol(
-                self.align(HelionValue(f"{self.tiles[axis]}.index", (axis,)), axes)
+                self.align(
+                    HelionValue(f"{self.tiles[axis]}.index", (axis,)),
+                    axes,
+                    for_index=True,
+                )
             )
             for axis, symbol in self.symbols.items()
             if symbol in symbols
         }
         replacements.update(
             {
-                symbol: sympy.Symbol(self.align(value, axes))
+                symbol: sympy.Symbol(self.align(value, axes, for_index=True))
                 for symbol, value in self.indirect_indices.items()
                 if symbol in symbols
             }
         )
         if symbols - replacements.keys():
             raise NotImplementedError(f"Unsupported Helion indexing: {index}")
-        printer = PythonPrinter()
+        printer = HelionPythonPrinter()
         return [
             printer.doprint(coord.xreplace(replacements), simplify=False)
             for coord in coordinates
@@ -278,7 +404,7 @@ class HelionKernel(DefaultHandler):
         return symbol
 
     def load(self, name: str, index: sympy.Expr) -> HelionValue:
-        index = sympy.sympify(index)
+        index = self.simplify_index(index)
         if (name, index) in self.store_forwarding:
             return self.store_forwarding[name, index]
         if self.current_matmul is not None:
@@ -304,10 +430,17 @@ class HelionKernel(DefaultHandler):
                     )
             raise NotImplementedError("Helion preview does not support fused prologues")
         operand = V.graph.get_buffer(name)
-        coordinates, axes = self.tensor_indices(operand, index)
-        argument = self.tensor_arg(operand)
+        argument = self.tensor_arg(operand, index=index)
+        coordinates, axes = self.tensor_indices(argument.operand, index)
         self.inputs.add(name)
         dtype = self.compute_dtype(operand.get_dtype())
+        if self.active_mask is not None:
+            mask = self.align(self.active_mask, axes, for_index=True)
+            return self.emit(
+                f"hl.load({argument.name}, [{', '.join(coordinates)}], "
+                f"extra_mask={mask}).to({dtype})",
+                axes,
+            )
         return self.emit(f"{argument.name}[{', '.join(coordinates)}].to({dtype})", axes)
 
     def constant(self, value: bool | float | int, dtype: torch.dtype) -> HelionValue:
@@ -317,6 +450,76 @@ class HelionKernel(DefaultHandler):
         else:
             literal = repr(value)
         return self.emit(f"hl.full([], {literal}, dtype={dtype})", ())
+
+    def index_expr(self, index: sympy.Expr, dtype: torch.dtype) -> HelionValue:
+        # Tile indices are tensors. A symbolic max(0, y - x) must become a
+        # tensor operation; Python max() cannot compare whole tile tensors.
+        index = self.simplify_index(index)
+        symbols = index.free_symbols
+        if not symbols:
+            value = int(index) if index.is_Integer else float(index)
+            return self.constant(value, dtype)
+        indirect_axes = OrderedSet(
+            [
+                axis
+                for symbol in symbols
+                if symbol in self.indirect_indices
+                for axis in self.indirect_indices[symbol].depending_indices
+            ]
+        )
+        axes = tuple(
+            axis
+            for axis in ("z", "y", "r0_", "x")
+            if axis in self.symbols
+            and (self.symbols[axis] in symbols or axis in indirect_axes)
+        )
+        replacements = {}
+        for axis in axes:
+            symbol = self.symbols[axis]
+            if symbol not in symbols:
+                continue
+            coordinate = f"{self.tiles[axis]}.index"
+            if len(axes) > 1:
+                broadcast = ", ".join(":" if dim == axis else "None" for dim in axes)
+                coordinate += f"[{broadcast}]"
+            replacements[symbol] = sympy.Symbol(coordinate)
+        replacements.update(
+            {
+                symbol: sympy.Symbol(self.align(value, axes, for_index=True))
+                for symbol, value in self.indirect_indices.items()
+                if symbol in symbols
+            }
+        )
+        if symbols - replacements.keys():
+            raise NotImplementedError(f"Unsupported Helion index expression: {index}")
+        expression = HelionPythonPrinter().doprint(
+            index.xreplace(replacements), simplify=False
+        )
+        return self.emit(f"({expression}).to({self.compute_dtype(dtype)})", axes)
+
+    def masked(
+        self,
+        mask: HelionValue,
+        body: Callable[[], HelionValue],
+        other: bool | float | int,
+    ) -> HelionValue:
+        previous_mask = self.active_mask
+        if previous_mask is not None:
+            mask = self._default("bitwise_and", (previous_mask, mask), {})
+        self.active_mask = mask
+        try:
+            result = body()
+        finally:
+            self.active_mask = previous_mask
+        literal = (
+            f"float({str(other)!r})"
+            if isinstance(other, float) and not math.isfinite(other)
+            else repr(other)
+        )
+        fallback = self.emit(
+            f"torch.full_like({result.name}, {literal})", result.depending_indices
+        )
+        return self._default("where", (mask, result, fallback), {})
 
     def to_dtype(
         self,
@@ -361,6 +564,9 @@ class HelionKernel(DefaultHandler):
         value: HelionValue,
         mode: str | None = None,
     ) -> None:
+        index = self.simplify_index(index)
+        if self.active_mask is not None:
+            raise NotImplementedError("Helion preview does not support masked stores")
         if mode not in (None, "atomic_add"):
             raise NotImplementedError(f"Unsupported Helion store mode: {mode}")
         operand = V.graph.get_buffer(name)
@@ -380,8 +586,8 @@ class HelionKernel(DefaultHandler):
                 raise NotImplementedError(
                     "Helion preview does not support bool atomic stores"
                 )
-            coordinates, axes = self.tensor_indices(operand, index)
-            argument = self.tensor_arg(operand)
+            argument = self.tensor_arg(operand, index=index)
+            coordinates, axes = self.tensor_indices(argument.operand, index)
             stored = self.align(value, axes)
             self.epilogue.writeline(
                 f"hl.atomic_add({argument.name}, [{', '.join(coordinates)}], "
@@ -390,8 +596,8 @@ class HelionKernel(DefaultHandler):
             return
         self.store_forwarding[name, sympy.sympify(index)] = value
         if name in self.outputs:
-            coordinates, axes = self.tensor_indices(operand, index)
-            argument = self.tensor_arg(operand)
+            argument = self.tensor_arg(operand, index=index)
+            coordinates, axes = self.tensor_indices(argument.operand, index)
             stored = self.align(value, axes)
             self.epilogue.writeline(
                 f"{argument.name}[{', '.join(coordinates)}] = "
@@ -413,14 +619,30 @@ class HelionKernel(DefaultHandler):
             "le": "<=",
             "gt": ">",
             "ge": ">=",
+            "bitwise_and": "&",
+            "and_": "&",
         }
-        unary = OrderedSet(["relu", "erf", "tanh", "neg", "sigmoid", "exp", "expm1"])
-        torch_ops = OrderedSet(["where", "minimum", "maximum"])
+        unary = OrderedSet(
+            [
+                "relu",
+                "erf",
+                "tanh",
+                "neg",
+                "sigmoid",
+                "exp",
+                "expm1",
+                "abs",
+                "log",
+                "logical_not",
+            ]
+        )
+        torch_ops = OrderedSet(["where", "minimum", "maximum", "logical_and"])
         if not kwargs and (name in binary or name in unary or name in torch_ops):
+            # Operand order must not set axis order: bias[x] + acc[y, x]
+            # keeps [y, x], and batched values keep [z, y, x].
+            axes = OrderedSet().union(*(value.depending_indices for value in args))
             depending_indices = tuple(
-                dict.fromkeys(
-                    axis for value in args for axis in value.depending_indices
-                )
+                axis for axis in ("z", "y", "r0_", "x") if axis in axes
             )
             values = [self.align(value, depending_indices) for value in args]
             # Torch pointwise ops are lowered by Helion; align the tile axes first.

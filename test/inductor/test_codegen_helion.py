@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ast
+import math
 import unittest
 from unittest.mock import Mock, patch
 
@@ -9,7 +10,7 @@ import sympy
 
 import torch
 from torch._inductor import config, ir
-from torch._inductor.codegen.helion import HelionKernel
+from torch._inductor.codegen.helion import HelionKernel, HelionValue
 from torch._inductor.codegen.triton import TritonScheduling
 from torch._inductor.decomposition import select_decomp_table
 from torch._inductor.graph import GraphLowering
@@ -17,6 +18,10 @@ from torch._inductor.sizevars import SizeVarAllocator
 from torch._inductor.virtualized import V
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.experimental.proxy_tensor import make_fx
+from torch.testing._internal.common_device_type import (
+    dtypes,
+    instantiate_device_type_tests,
+)
 from torch.testing._internal.common_utils import (
     HardwareClassification,
     instantiate_parametrized_tests,
@@ -25,6 +30,7 @@ from torch.testing._internal.common_utils import (
     TestCase,
 )
 from torch.testing._internal.inductor_utils import HAS_CUDA_AND_TRITON
+from torch.utils._sympy.functions import FloorDiv, ModularIndexing
 
 
 class CodegenComplete(Exception):
@@ -130,6 +136,101 @@ class TestHelionCodegen(TestCase):
         self.assertIn("helion_op0(a_1, b_1, buf0)", source)
         self.assertNotIn("reinterpret_tensor", source)
 
+    @parametrize(
+        "axes",
+        [
+            ("z",),
+            ("y",),
+            ("r0_",),
+            ("x",),
+            ("y", "x"),
+            ("y", "r0_"),
+            ("r0_", "x"),
+            ("z", "y", "r0_"),
+            ("z", "r0_", "x"),
+            ("z", "y", "r0_", "x"),
+        ],
+    )
+    def test_index_expr_axes(self, axes):
+        from types import SimpleNamespace
+
+        features = Mock()
+        features.scheduler_nodes.return_value = ()
+        features.op_counts.return_value = {"dot": 0}
+        tiling = {
+            axis: sympy.Integer(size)
+            for axis, size in zip(("z", "y", "x", "r0_"), (2, 3, 5, 4))
+        }
+        with V.set_graph_handler(
+            Mock(helion_matmul_inputs={}, sizevars=SizeVarAllocator())
+        ):
+            kernel = HelionKernel(features, tiling)
+            expression = sum(
+                (i + 1) * kernel.symbols[axis] for i, axis in enumerate(axes)
+            )
+            value = kernel.index_expr(expression, torch.int64)
+        self.assertEqual(value.depending_indices, axes)
+        scope = {"torch": torch}
+        vectors = []
+        for axis in axes:
+            vector = torch.arange(int(tiling[axis]))
+            vectors.append(vector)
+            scope[kernel.tiles[axis]] = SimpleNamespace(index=vector)
+        exec(kernel.reduction_body.getvalue(), scope)
+        coordinates = torch.meshgrid(*vectors, indexing="ij")
+        expected = sum((i + 1) * coord for i, coord in enumerate(coordinates))
+        self.assertEqual(scope[value.name], expected)
+
+    def test_index_expr_mm_epilogue(self):
+        (source,) = self.codegen(
+            lambda a, b: a @ b
+            + torch.arange(40 * 136, device=a.device).reshape(40, 136),
+            [(40, 72), (72, 136)],
+            decompose=True,
+        )
+        self.assertIn("tile_y.index[:, None]", source)
+        self.assertIn("tile_x.index[None, :]", source)
+
+    def test_index_expr_bmm_epilogue(self):
+        (source,) = self.codegen(
+            lambda a, b: torch.bmm(a, b)
+            + torch.arange(3 * 40 * 136, device=a.device).reshape(3, 40, 136),
+            [(3, 40, 72), (3, 72, 136)],
+            decompose=True,
+        )
+        self.assertIn("tile_z.index[:, None, None]", source)
+        self.assertIn("tile_y.index[None, :, None]", source)
+        self.assertIn("tile_x.index[None, None, :]", source)
+
+    @parametrize("batched", [False, True])
+    @parametrize(
+        "axes", [("y", "x"), ("y", "r0_"), ("r0_", "x"), ("y",), ("x",), ("r0_",)]
+    )
+    def test_pointwise_axis_order(self, batched, axes):
+        tiling = dict(zip(("y", "x", "r0_"), map(sympy.Integer, (3, 5, 4))))
+        if batched:
+            tiling = {"z": sympy.Integer(2), **tiling}
+            axes = ("z", *axes)
+        features = Mock()
+        features.scheduler_nodes.return_value = ()
+        features.op_counts.return_value = {}
+        with V.set_graph_handler(Mock(helion_matmul_inputs={})):
+            kernel = HelionKernel(features, tiling)
+        scope = {"torch": torch, "zero": torch.zeros((), dtype=torch.int64)}
+        scope.update({kernel.tiles[axis]: int(size) for axis, size in tiling.items()})
+        value = HelionValue("zero", ())
+        vectors = {axis: torch.arange(int(tiling[axis])) for axis in axes}
+        for axis in reversed(axes):
+            name = f"v_{axis}"
+            scope[name] = vectors[axis]
+            value = kernel._default("add", (value, HelionValue(name, (axis,))), {})
+        self.assertEqual(value.depending_indices, axes)
+        source = kernel.reduction_body.getvalue()
+        self.assertNotIn(".permute(", source)
+        exec(source, scope)
+        expected = sum(torch.meshgrid(*vectors.values(), indexing="ij"))
+        self.assertEqual(scope[value.name], expected)
+
     def test_bias_relu(self):
         schedules = []
         (source,) = self.codegen(
@@ -140,16 +241,54 @@ class TestHelionCodegen(TestCase):
         self.assertEqual(len(schedules), 1)
         self.assertGreater(len(tuple(schedules[0].scheduler_nodes())), 1)
         self.assertIn("in0[tile_x].to(torch.float32)", source)
-        self.assertIn("tmp5 = acc + tmp4.reshape([1, tile_x])", source)
+        self.assertIn("tmp5 = acc + tmp4", source)
         self.assertIn("tmp6 = torch.relu(tmp5)", source)
         self.assertNotIn("hl.load(buf", source)
 
     @parametrize(
-        "op", [torch.erf, torch.tanh, torch.neg, torch.sigmoid, torch.exp, torch.expm1]
+        "op",
+        [
+            torch.erf,
+            torch.tanh,
+            torch.neg,
+            torch.sigmoid,
+            torch.exp,
+            torch.expm1,
+            torch.abs,
+            torch.log,
+        ],
     )
     def test_unary_epilogue(self, op):
         (source,) = self.codegen(lambda a, b: op(a @ b), [(40, 72), (72, 136)])
         self.assertIn(f"torch.{op.__name__}(", source)
+
+    def test_logical_not_epilogue(self):
+        (source,) = self.codegen(
+            lambda a, b: torch.logical_and(torch.logical_not(a @ b), a @ b > 0),
+            [(40, 72), (72, 136)],
+        )
+        self.assertIn("torch.logical_not(", source)
+        self.assertIn("torch.logical_and(", source)
+
+    def test_bitwise_and_epilogue(self):
+        def fn(a, b):
+            index = torch.arange(136, device=a.device)
+            return a @ b + torch.bitwise_and(index, 7)
+
+        (source,) = self.codegen(fn, [(40, 72), (72, 136)], decompose=True)
+        self.assertIn(" & ", source)
+
+    def test_masked_epilogue_load(self):
+        def fn(a, b, first, second):
+            return a @ b + torch.cat((first, second))
+
+        (source,) = self.codegen(
+            fn, [(40, 72), (72, 136), (64,), (72,)], decompose=True
+        )
+        self.assertIn("hl.load(", source)
+        self.assertIn("extra_mask=", source)
+        self.assertIn("torch.full_like(", source)
+        self.assertIn("torch.where(", source)
 
     def test_where_epilogue_broadcast(self):
         def fn(a, b, bias):
@@ -159,7 +298,121 @@ class TestHelionCodegen(TestCase):
         (source,) = self.codegen(fn, [(40, 72), (72, 136), (136,)])
         self.assertIn(" <= ", source)
         self.assertIn("torch.where(", source)
-        self.assertIn(".reshape([1, tile_x])", source)
+        self.assertNotIn(".reshape(", source)
+
+    @parametrize("block,count", [(3, 5), (8, 7), (64, 12)])
+    def test_index_expr_modulo_cancellation(self, block, count):
+        features = Mock()
+        features.scheduler_nodes.return_value = ()
+        features.op_counts.return_value = {}
+        tiling = dict(
+            zip(("y", "x", "r0_"), map(sympy.Integer, (17, block * count, 16)))
+        )
+        with V.set_graph_handler(
+            Mock(helion_matmul_inputs={}, sizevars=SizeVarAllocator())
+        ):
+            kernel = HelionKernel(features, tiling)
+            x, y = kernel.symbols["x"], kernel.symbols["y"]
+            index = ModularIndexing(x, 1, block) + block * ModularIndexing(
+                FloorDiv(x, block) + count * ModularIndexing(y, 1, 4), 1, count
+            )
+            value = kernel.index_expr(index, torch.int64)
+        self.assertEqual(value.depending_indices, ("x",))
+        source = kernel.reduction_body.getvalue()
+        self.assertNotIn("tile_y", source)
+        self.assertNotIn("%", source)
+        self.assertNotIn("//", source)
+
+    @parametrize("op", [sympy.Min, sympy.Max])
+    def test_index_expr_tensor_min_max(self, op):
+        features = Mock()
+        features.scheduler_nodes.return_value = ()
+        features.op_counts.return_value = {}
+        tiling = dict(zip(("y", "x", "r0_"), map(sympy.Integer, (40, 136, 72))))
+        with V.set_graph_handler(
+            Mock(helion_matmul_inputs={}, sizevars=SizeVarAllocator())
+        ):
+            kernel = HelionKernel(features, tiling)
+            value = kernel.index_expr(
+                op(0, kernel.symbols["y"] - kernel.symbols["x"]), torch.int64
+            )
+        source = kernel.reduction_body.getvalue()
+        self.assertEqual(value.depending_indices, ("y", "x"))
+        name = "minimum" if op is sympy.Min else "maximum"
+        self.assertIn(f"torch.{name}(", source)
+        self.assertNotIn(f"{op.__name__.lower()}(", source)
+
+    def test_explicit_index_broadcast_rank(self):
+        (source,) = self.codegen(
+            lambda a, b, bias: (a @ b).reshape(5, 8, 136) + bias.transpose(1, 2),
+            [(40, 72), (72, 136), (5, 136, 8)],
+            decompose=True,
+        )
+        self.assertIn("tile_x.index.reshape([1, tile_x])", source)
+
+    @parametrize("row_bias", [False, True])
+    def test_bmm_broadcast_singleton_view(self, row_bias):
+        shape = (2, 1, 40, 1 if row_bias else 136)
+        (source,) = self.codegen(
+            lambda a, b, bias: torch.bmm(a, b).reshape(2, 3, 40, 136) + bias,
+            [(6, 40, 72), (6, 72, 136), shape],
+            decompose=True,
+        )
+        self.assertIn("reinterpret_tensor(bias_1,", source)
+        indices = [
+            n.slice
+            for n in ast.walk(ast.parse(source))
+            if isinstance(n, ast.Subscript)
+            and isinstance(n.value, ast.Name)
+            and n.value.id == "in0"
+        ]
+        for index in indices:
+            coordinates = index.elts if isinstance(index, ast.Tuple) else [index]
+            self.assertEqual(len(coordinates), 2 if row_bias else 3)
+            self.assertFalse(
+                any(isinstance(c, ast.Constant) and c.value == 0 for c in coordinates)
+            )
+
+    @config.patch(comprehensive_padding=False)
+    def test_bmm_affine_permuted_output_view(self):
+        def fn(a, b):
+            result = torch.bmm(a, b).reshape(2, 3, 40, 136)
+            permuted = result.permute(3, 0, 1, 2).unsqueeze(2)
+            return permuted.clone(memory_format=torch.contiguous_format)
+
+        (source,) = self.codegen(fn, [(6, 40, 72), (6, 72, 136)], decompose=True)
+        self.assertIn("out0[tile_z, tile_y, tile_x]", source)
+        self.assertIn("(6, 40, 136), (40, 1, 240), 0)", source)
+        self.assertNotIn("%", source)
+        self.assertNotIn("//", source)
+
+    @parametrize("axis", ["row", "column", "matrix"])
+    def test_addmm_epilogue_axis_order(self, axis):
+        shapes = {"row": (40, 1), "column": (136,), "matrix": (40, 136)}
+        (source,) = self.codegen(
+            lambda bias, a, b: torch.addmm(bias, a, b, alpha=1.25, beta=0.75),
+            [shapes[axis], (40, 72), (72, 136)],
+            decompose=True,
+        )
+        self.assertNotIn(".permute(", source)
+        if axis == "row":
+            self.assertIn(".reshape([tile_y, 1])", source)
+        else:
+            self.assertNotIn(".reshape(", source)
+
+    @parametrize("batched", [False, True])
+    @parametrize("op", [torch.add, torch.sub, torch.mul, torch.maximum])
+    def test_bias_first_epilogue_axis_order(self, batched, op):
+        def fn(a, b, bias):
+            result = torch.bmm(a, b) if batched else a @ b
+            return op(bias, result)
+
+        shapes = [(40, 72), (72, 136)]
+        if batched:
+            shapes = [(3, *shape) for shape in shapes]
+        (source,) = self.codegen(fn, [*shapes, (40, 136)])
+        self.assertNotIn(".permute(", source)
+        self.assertNotIn(".reshape(", source)
 
     @parametrize("axis", ["row", "column", "matrix"])
     def test_epilogue_broadcast(self, axis):
@@ -228,6 +481,60 @@ class TestHelionCodegen(TestCase):
         self.assertEqual(lhs.untyped_storage()._cdata, a.untyped_storage()._cdata)
         self.assertIs(rhs, b)
         self.assertIs(result, out)
+
+    @parametrize("batched", [False, True])
+    @parametrize("layout", ["contiguous", "strided", "permuted", "higher_rank"])
+    @config.patch(comprehensive_padding=False)
+    def test_folded_epilogue_inputs_outputs(self, batched, layout):
+        split = (2, 5, 4) if layout == "higher_rank" else (5, 8)
+        matrix_shape = (*split, 136)
+        matrix_stride = list(ir.FlexibleLayout.contiguous_strides(matrix_shape))
+        if layout == "strided":
+            matrix_stride = [8 * 144, 144, 1]
+        elif layout == "permuted":
+            matrix_shape = (8, 5, 136)
+            matrix_stride = [136, 8 * 136, 1]
+
+        def fn(a, b, matrix, row):
+            result = torch.bmm(a, b) if batched else a @ b
+            shape = (3, *split, 136) if batched else (*split, 136)
+            if layout == "permuted":
+                matrix = matrix.transpose(-3, -2)
+            return (result.reshape(shape) + matrix) * row
+
+        shapes = [(40, 72), (72, 136), matrix_shape, (*split, 1)]
+        row_stride = list(ir.FlexibleLayout.contiguous_strides(shapes[-1]))
+        strides = [[72, 1], [136, 1], matrix_stride, row_stride]
+        if batched:
+            shapes = [(3, *shape) for shape in shapes]
+            strides = [
+                [math.prod(shape[1:]), *stride]
+                for shape, stride in zip(shapes, strides)
+            ]
+            if layout == "strided":
+                strides[2][0] = 40 * 144
+        (source,) = self.codegen(fn, shapes, strides=strides, decompose=True)
+        axes = "tile_z, tile_y, tile_x" if batched else "tile_y, tile_x"
+        row_axes = "tile_z, tile_y" if batched else "tile_y"
+        self.assertIn(f"in0[{axes}]", source)
+        self.assertIn(f"in1[{row_axes}]", source)
+        self.assertIn(f"out0[{axes}]", source)
+        self.assertIn("reinterpret_tensor(matrix_1,", source)
+        self.assertIn("reinterpret_tensor(row_1,", source)
+        self.assertIn("reinterpret_tensor(buf", source)
+        self.assertNotIn("tile_y.index", source)
+        self.assertNotIn("tile_x.index", source)
+
+    def test_unfoldable_epilogue_input(self):
+        with self.assertRaisesRegex(
+            NotImplementedError, "Cannot recover Helion tensor indices"
+        ):
+            self.codegen(
+                lambda a, b, bias: (a @ b).reshape(5, 8, 136) + bias,
+                [(40, 72), (72, 136), (5, 8, 136)],
+                strides=[(72, 1), (136, 1), (1200, 144, 1)],
+                decompose=True,
+            )
 
     def test_same_storage_two_operand_views(self):
         (source,) = self.codegen(lambda a: a @ a.T, [(40, 72)])
@@ -535,6 +842,45 @@ class TestHelionCodegen(TestCase):
         with config.patch("triton.codegen_upcast_to_fp32", False):
             with self.assertRaisesRegex(NotImplementedError, "FP32 compute upcasting"):
                 self.codegen(lambda a, b: a @ b, [(40, 72), (72, 136)])
+
+
+class TestHelionIndexExpressions(TestCase):
+    hw_classification = HardwareClassification.ACCELERATOR
+
+    @parametrize("op", [sympy.Min, sympy.Max])
+    @dtypes(torch.int64, torch.float32)
+    def test_integer_min_max_before_cast(self, device, dtype, op):
+        from types import SimpleNamespace
+
+        limit = 2**25 + 1
+        integers = [limit - 2, limit - 1, limit, limit + 1, limit + 2]
+        features = Mock()
+        features.scheduler_nodes.return_value = ()
+        features.op_counts.return_value = {}
+        tiling = dict(zip(("y", "x", "r0_"), map(sympy.Integer, (1, limit + 3, 1))))
+        graph = Mock(helion_matmul_inputs={}, sizevars=SizeVarAllocator())
+        with V.set_graph_handler(graph):
+            kernel = HelionKernel(features, tiling)
+            x = kernel.symbols["x"]
+            value = kernel.index_expr(op(x, limit) - x, dtype)
+        scope = {
+            "torch": torch,
+            "tile_x": SimpleNamespace(index=torch.tensor(integers, device=device)),
+            "hl": SimpleNamespace(
+                full=lambda shape, value, dtype: torch.full(
+                    shape, value, dtype=dtype, device=device
+                )
+            ),
+        }
+        exec(kernel.reduction_body.getvalue(), scope)
+        operation = min if op is sympy.Min else max
+        expected = torch.tensor(
+            [operation(n, limit) - n for n in integers], device=device, dtype=dtype
+        )
+        self.assertEqual(scope[value.name], expected)
+
+
+instantiate_device_type_tests(TestHelionIndexExpressions, globals())
 
 
 if __name__ == "__main__":
