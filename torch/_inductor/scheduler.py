@@ -9435,7 +9435,14 @@ class Scheduler:
                 # not an integer. Fallback is to fuse
                 return False
 
-        bw_saving = self.score_fusion_memory(node1, node2)
+        matches = self.get_backend(node1.get_device()).fusion_dependency_matches(
+            node1, node2
+        )
+        bw_saving = (
+            self.score_fusion_memory(node1, node2)
+            if matches is None
+            else self._score_staged_fusion_memory_for_can_fuse(node1, node2, matches)
+        )
 
         # The factor 32 here is quite arbitrary.
         if V.graph.sizevars.statically_known_gt(memory_overhead, 32 * bw_saving):
@@ -11177,6 +11184,11 @@ class Scheduler:
             if staged_matches is None:
                 why("staged fusion dependency proof failed")
                 return False
+        else:
+            # The backend may prove reads that the exact matching below rejects.
+            staged_matches = self.get_backend(device).fusion_dependency_matches(
+                node1, node2
+            )
         # Continue through ordinary scoring and legality. Plan presence also
         # freezes the generic loop rewrites below, including for an empty match
         # tuple.
@@ -13497,6 +13509,16 @@ class BaseScheduling:  # noqa: docstring_linter
         self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
     ) -> bool:
         return True
+
+    def fusion_dependency_matches(
+        self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
+    ) -> tuple[MemoryDepMatch, ...] | None:
+        """
+        Reads of node2 that node1's writes satisfy inside one fused kernel
+        although their indices differ, which ordinary vertical fusion would
+        reject. None if the backend proves no such reads.
+        """
+        return None
 
     def can_fuse_multi_outputs_template(
         self, node1: BaseSchedulerNode, node2: BaseSchedulerNode

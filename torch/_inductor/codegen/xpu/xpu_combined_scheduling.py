@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     from sympy import Expr
 
     import torch
+    from torch._inductor.scheduler import MemoryDepMatch
     from torch.utils._ordered_set import OrderedSet
 
     from ..common import BackendFeature, Kernel
@@ -50,6 +51,11 @@ class XPUCombinedScheduling(BaseScheduling):
 
     def has_sub_parent_epilogue(self, nodes: Sequence[BaseSchedulerNode]) -> bool:
         return self._triton_scheduling.has_sub_parent_epilogue(nodes)
+
+    def fusion_dependency_matches(
+        self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
+    ) -> tuple[MemoryDepMatch, ...] | None:
+        return self._triton_scheduling.fusion_dependency_matches(node1, node2)
 
     def choose_node_backend(self, node: BaseSchedulerNode) -> BaseScheduling:
         if self._cutlass_scheduling.is_cutlass_template(node):

@@ -2367,12 +2367,22 @@ class _GroupedReductionOpsHandler(WrapperHandler):  # type: ignore[type-arg]
 
 class _NativeMatmulRowLoadHandler(WrapperHandler):  # type: ignore[type-arg]
     """Reshape native matmul [YBLOCK, XBLOCK, 1] tile values into the rank-2
-    [YBLOCK, XBLOCK] row space."""
+    [YBLOCK, XBLOCK] row space, or into the [YBLOCK, 1, XBLOCK] left operand
+    of a dot stage, whose r0_ is the tile's last axis (see
+    SIMDScheduling._codegen_native_matmul_row_epilogue)."""
 
-    def __init__(self, inner, kernel: TritonKernel, tile_buffers: OrderedSet[str]):
+    def __init__(
+        self,
+        inner,
+        kernel: TritonKernel,
+        tile_buffers: OrderedSet[str],
+        *,
+        dot_stage: bool = False,
+    ):
         super().__init__(inner)
         self._kernel = kernel
         self._tile_buffers = tile_buffers
+        self._dot_stage = dot_stage
 
     def load(self, name: str, index: sympy.Expr) -> CSEVariable:
         value = self._inner.load(name, index)
@@ -2399,7 +2409,17 @@ class _NativeMatmulRowLoadHandler(WrapperHandler):  # type: ignore[type-arg]
                     "native matmul tile source must have a known dtype"
                 )
             shape = self._kernel.dense_size_list()
+            if self._dot_stage:
+                # The tile spans the rows and its last axis (now r0_), not x.
+                (x_tree,) = (t for t in self._kernel.range_trees if t.prefix == "x")
+                shape[cast("int", x_tree.tensor_dim)] = "1"
             value = self._kernel.emit_reshape(value, shape, value.dtype)
+            if self._dot_stage:
+                # Lanes past the tile's extent hold whatever the previous stage
+                # computed there, so ops.dot must zero them before reducing r0_.
+                cast("TritonCSEVariable", value).mask_vars.update(
+                    t.mask_name() for t in self._kernel.range_trees if t.prefix != "x"
+                )
         return value
 
 
@@ -2954,10 +2974,11 @@ class SIMDScheduling(BaseScheduling):
     @staticmethod
     def _native_matmul_row_split(
         nodes: Sequence[BaseSchedulerNode],
-    ) -> tuple[sympy.Expr, int, int] | None:
-        """Return (M, N, index of the first row node) for a non-batched native
-        matmul [M, N] output followed by row nodes: [M, N] -> [M] reductions
-        and [M] pointwise ops."""
+    ) -> tuple[tuple[sympy.Expr, ...], int, int] | None:
+        """Return (row ranges, N, index of the first row node) for a native
+        matmul [*rows, N] output followed by row nodes: [M, N] -> [M]
+        reductions and [M] pointwise ops of a non-batched matmul, or dot
+        stages (see _native_matmul_dot_stages)."""
         mm_index = next(
             (
                 i
@@ -2972,19 +2993,57 @@ class SIMDScheduling(BaseScheduling):
         if not isinstance(mm, scheduler.SchedulerNode):
             return None
         iter_ranges, _ = mm.get_ranges()
-        if len(iter_ranges) != 2 or not isinstance(iter_ranges[1], sympy.Integer):
+        if len(iter_ranges) not in (2, 3) or not isinstance(
+            iter_ranges[-1], sympy.Integer
+        ):
             return None
-        m, n = iter_ranges[0], int(iter_ranges[1])
+        rows, n = tuple(iter_ranges[:-1]), int(iter_ranges[-1])
+        tile = OrderedSet(mm.get_buffer_names())
         for i in range(mm_index + 1, len(nodes)):
-            if SIMDScheduling._is_native_matmul_row_node(nodes[i], m, n):
-                return m, n, i
-        return m, n, len(nodes)
+            if SIMDScheduling._is_native_matmul_row_node(nodes[i], rows, n) or (
+                SIMDScheduling._native_matmul_dot_row_width(nodes[i], rows, n, tile)
+                is not None
+            ):
+                return rows, n, i
+            tile |= nodes[i].get_buffer_names()
+        return rows, n, len(nodes)
+
+    @staticmethod
+    def _native_matmul_dot_row_width(
+        node: BaseSchedulerNode,
+        rows: tuple[sympy.Expr, ...],
+        n: int,
+        tile: OrderedSet[str],
+    ) -> int | None:
+        """L of a native matmul [*rows, L] that reads the tile buffers and
+        reduces over the N columns of the rows, e.g. the second product of a
+        back-to-back GEMM."""
+        if not (
+            isinstance(node, scheduler.SchedulerNode)
+            and SIMDScheduling._is_native_matmul_node(node)
+        ):
+            return None
+        sizevars = V.graph.sizevars
+        iter_ranges, reduce_ranges = node.get_ranges()
+        if (
+            len(iter_ranges) != len(rows) + 1
+            or len(reduce_ranges) != 1
+            or not isinstance(iter_ranges[-1], sympy.Integer)
+            or not sizevars.statically_known_equals(reduce_ranges[0], n)
+            or not all(
+                sizevars.statically_known_equals(size, row)
+                for size, row in zip(iter_ranges, rows)
+            )
+            or not (node.used_buffer_names() & tile)
+        ):
+            return None
+        return int(iter_ranges[-1])
 
     @staticmethod
     def _is_native_matmul_row_node(
-        node: BaseSchedulerNode, m: sympy.Expr, n: int
+        node: BaseSchedulerNode, rows: tuple[sympy.Expr, ...], n: int
     ) -> bool:
-        if not isinstance(node, scheduler.SchedulerNode):
+        if not isinstance(node, scheduler.SchedulerNode) or len(rows) != 1:
             return False
         if any(
             isinstance(dep, MemoryDep) and free_symbol_is_type(dep.index, SymT.TMP)
@@ -2993,7 +3052,7 @@ class SIMDScheduling(BaseScheduling):
             return False
         sizevars = V.graph.sizevars
         iter_ranges, reduce_ranges = node.get_ranges()
-        if not sizevars.statically_known_equals(sympy_product(iter_ranges), m):
+        if not sizevars.statically_known_equals(sympy_product(iter_ranges), rows[0]):
             return False
         if not reduce_ranges:
             return True
@@ -3007,26 +3066,174 @@ class SIMDScheduling(BaseScheduling):
             and buf.data.reduction_type in ("sum", "prod", "max", "min", "any")
         )
 
+    @staticmethod
+    def _is_native_matmul_dot_epilogue(
+        node: BaseSchedulerNode, rows: tuple[sympy.Expr, ...], width: int
+    ) -> bool:
+        """A pointwise node over the [*rows, L] output of a dot stage."""
+        if not isinstance(node, scheduler.SchedulerNode) or node.is_reduction():
+            return False
+        if any(
+            isinstance(dep, MemoryDep) and free_symbol_is_type(dep.index, SymT.TMP)
+            for dep in node.read_writes.reads
+        ):
+            return False
+        iter_ranges, _ = node.get_ranges()
+        return V.graph.sizevars.statically_known_equals(
+            sympy_product(iter_ranges), sympy_product(rows) * width
+        )
+
+    @staticmethod
+    def _native_matmul_dot_stages(
+        row_nodes: Sequence[BaseSchedulerNode],
+        rows: tuple[sympy.Expr, ...],
+        n: int,
+        tile: OrderedSet[str],
+    ) -> list[tuple[int, list[BaseSchedulerNode]]] | None:
+        """Split row nodes into dot stages (L, [matmul, *epilogues]): each
+        matmul reads the stage before it (the tile for the first one) and
+        contracts its L (N for the first one). None if the row nodes do not
+        start with such a matmul."""
+        stages: list[tuple[int, list[BaseSchedulerNode]]] = []
+        width = n
+        for sn in row_nodes:
+            dot_width = SIMDScheduling._native_matmul_dot_row_width(
+                sn, rows, width, tile
+            )
+            if dot_width is not None:
+                stages.append((dot_width, [sn]))
+                width, tile = dot_width, OrderedSet(sn.get_buffer_names())
+            elif stages:
+                stages[-1][1].append(sn)
+                tile = tile | sn.get_buffer_names()
+            else:
+                return None
+        return stages
+
+    def _native_matmul_dot_stages_fit(
+        self,
+        outer_nodes: Sequence[BaseSchedulerNode],
+        stages: list[tuple[int, list[BaseSchedulerNode]]],
+        rows: tuple[sympy.Expr, ...],
+    ) -> bool:
+        """Each stage holds all L columns of its rows in one block, and sees the
+        values of earlier stages only through its matmul's left operand, which
+        is the stage just before it laid out with that stage's L on r0_."""
+        tile = OrderedSet(name for sn in outer_nodes for name in sn.get_buffer_names())
+        older: OrderedSet[str] = OrderedSet()
+        for width, (dot, *epilogues) in stages:
+            if width > self.MAX_NATIVE_MATMUL_ROW_SIZE or (
+                dot.used_buffer_names() & older
+            ):
+                return False
+            if not all(
+                self._is_native_matmul_dot_epilogue(sn, rows, width)
+                and not (sn.used_buffer_names() & (tile | older))
+                for sn in epilogues
+            ):
+                return False
+            older |= tile
+            tile = OrderedSet(
+                name for sn in (dot, *epilogues) for name in sn.get_buffer_names()
+            )
+        return True
+
+    def fusion_dependency_matches(self, node1, node2):
+        """Prove the tile reads of the first matmul node2 adds to a dot stage.
+
+        C[*rows, l] = sum_r tile[*rows, r] * B[r, l] reads the previous stage's
+        tile at its reduction index r, which that stage writes at its x index.
+        Each program owns complete rows of every stage (min_xblock = N and one
+        block for each L), so the reads are satisfied in the same program
+        although the read and write indices differ.
+        """
+        nodes1, nodes2 = node1.get_nodes(), node2.get_nodes()
+        if self._native_matmul_row_split(nodes1) is None:
+            return None
+        nodes = [*nodes1, *nodes2]
+        rows, n, first_row = cast(
+            "tuple[tuple[sympy.Expr, ...], int, int]",
+            self._native_matmul_row_split(nodes),
+        )
+        mm_index = next(
+            i for i, node in enumerate(nodes) if self._is_native_matmul_node(node)
+        )
+        outer = nodes[mm_index:first_row]
+        tile = OrderedSet(name for sn in outer for name in sn.get_buffer_names())
+        stages = self._native_matmul_dot_stages(nodes[first_row:], rows, n, tile)
+        if not stages:
+            return None
+        first_new = next(
+            (i for i, (_, sns) in enumerate(stages) if sns[0] in nodes2), None
+        )
+        if first_new is None:
+            return None
+        tile_nodes = stages[first_new - 1][1] if first_new else outer
+        writes = {
+            dep.name: dep
+            for sn in tile_nodes
+            for dep in sn.read_writes.writes
+            if isinstance(dep, MemoryDep)
+        }
+        k = len(rows)
+        matches = []
+        for read in stages[first_new][1][0].read_writes.reads:
+            if (write := writes.get(read.name)) is None:
+                continue
+            if not (
+                isinstance(read, MemoryDep)
+                and len(read.var_names) == k + 2
+                and len(write.var_names) == k + 1
+                and read.size[:k] == write.size[:k]
+                and read.size[-1] == write.size[-1]
+            ):
+                return None
+            # rows -> rows, r -> x; the read must not depend on the dot's x.
+            subs = dict(zip(read.var_names[:k], write.var_names[:k]))
+            subs[read.var_names[-1]] = write.var_names[-1]
+            if read.var_names[k] in read.index.free_symbols or (
+                sympy_subs(read.index, subs) != write.index
+            ):
+                return None
+            matches.append(scheduler.MemoryDepMatch(write, read))
+        return tuple(matches) or None
+
     def _native_matmul_row_epilogue_can_fuse(self, node1, node2) -> bool:
         """Whether node2 consumes complete rows of node1's native matmul output.
 
-        Index alignment of node2's reads is proven by ordinary vertical fusion.
+        Index alignment of node2's reads is proven by ordinary vertical fusion,
+        or by fusion_dependency_matches for the matmul that starts a dot stage.
         """
-        nodes1 = node1.get_nodes()
-        split = self._native_matmul_row_split(nodes1)
-        if split is None or split[1] > self.MAX_NATIVE_MATMUL_ROW_SIZE:
+        nodes1, nodes2 = node1.get_nodes(), node2.get_nodes()
+        if self._native_matmul_row_split(nodes1) is None:
             return False
-        m, n, _ = split
-        if not all(
-            self._is_native_matmul_row_node(sn, m, n) for sn in node2.get_nodes()
+        nodes = [*nodes1, *nodes2]
+        split = self._native_matmul_row_split(nodes)
+        # node2 must continue the row stage (or start it with its first node).
+        if (
+            split is None
+            or split[1] > self.MAX_NATIVE_MATMUL_ROW_SIZE
+            or split[2] > len(nodes1)
         ):
-            # TODO: Support M-axis reductions by reordering the matmul loops.
-            # Dot reductions (including back-to-back GEMMs) also need a separate stage.
             return False
+        rows, n, first_row = split
         # Values written before the mm (prologues) live in its [M, K] tile.
         mm_index = next(
             i for i, node in enumerate(nodes1) if self._is_native_matmul_node(node)
         )
+        outer = nodes[mm_index:first_row]
+        tile = OrderedSet(name for sn in outer for name in sn.get_buffer_names())
+        stages = self._native_matmul_dot_stages(nodes[first_row:], rows, n, tile)
+        if stages:
+            if not self._native_matmul_dot_stages_fit(outer, stages, rows):
+                return False
+            if any(sns[0] in nodes2 for _, sns in stages) and (
+                self.fusion_dependency_matches(node1, node2) is None
+            ):
+                return False
+        elif not all(self._is_native_matmul_row_node(sn, rows, n) for sn in nodes2):
+            # TODO: Support M-axis reductions by reordering the matmul loops.
+            return False
         _, reduce_ranges = nodes1[mm_index].get_ranges()
         # Conservative profitability limit from H100 matmul/matvec measurements.
         if not V.graph.sizevars.statically_known_leq(
@@ -3055,8 +3262,13 @@ class SIMDScheduling(BaseScheduling):
         split = self._native_matmul_row_split(node1.get_nodes())
         if split is not None:
             row_epilogue = self._native_matmul_row_epilogue_can_fuse(node1, node2)
-            # Once the row stage has started, only row nodes can follow it.
-            if row_epilogue or split[2] < len(node1.get_nodes()):
+            nodes = [*node1.get_nodes(), *node2.get_nodes()]
+            # Once the row stage has started, only row nodes can follow it, and
+            # a fusion that would start it is decided by the row stage too.
+            if row_epilogue or cast(
+                "tuple[tuple[sympy.Expr, ...], int, int]",
+                self._native_matmul_row_split(nodes),
+            )[2] < len(nodes):
                 return row_epilogue
 
         _, (numel1, rnumel1) = node1.group
@@ -4543,12 +4755,22 @@ class SIMDScheduling(BaseScheduling):
         )
 
     def _codegen_native_matmul_row_epilogue(self, nodes):
-        """Native matmul whose [M, N] output is reduced over complete rows.
+        """Native matmul whose [M, N] output is consumed by complete rows.
 
-        After the dot, K is gone and the [YBLOCK, XBLOCK] tile is an ordinary
-        persistent reduction over N. min_xblock = N gives each program complete
-        rows, so the row nodes run in a rank-2 space with rows on x (block
-        YBLOCK) and N on r0_ (block XBLOCK).
+        After the dot, K is gone and min_xblock = N gives each program complete
+        rows of the [YBLOCK, XBLOCK] tile. The row nodes replay in a derived
+        space that reads the tile from registers:
+
+        - [M, N] -> [M] reductions and [M] pointwise ops run in a rank-2 space
+          with rows on x (block YBLOCK) and N on r0_ (block XBLOCK), an
+          ordinary persistent reduction over N.
+        - A native matmul [*rows, L] that contracts N (the second product of a
+          back-to-back GEMM) and its [*rows, L] pointwise epilogues form a dot
+          stage. It runs in a native matmul space that keeps the row axes,
+          moves N to r0_ (block XBLOCK) and puts L on x (one named block), so
+          the tile is the left operand of its tl.dot. A further matmul that
+          contracts L starts the next dot stage the same way, which fuses an
+          MLP chain into one kernel.
         """
         features = self._kernel_features_from_nodes(nodes)
         outer_schedule = features.node_schedule
@@ -4570,19 +4792,24 @@ class SIMDScheduling(BaseScheduling):
         self._finalize_nested_reduction_kernels(kernels, combined_schedule, nodes)
 
     def _codegen_native_matmul_row_epilogue_with_kernel(
-        self, nodes, kernel, m, n, first_row_node
+        self, nodes, kernel, rows, n, first_row_node
     ):
         outer_nodes, row_nodes = nodes[:first_row_node], nodes[first_row_node:]
         outer_schedule = kernel.features.node_schedule
-        tile_buffers = OrderedSet(
-            name for sn in outer_nodes for name in sn.get_buffer_names()
+        stages = self._native_matmul_dot_stages(
+            row_nodes,
+            rows,
+            n,
+            OrderedSet(name for sn in outer_nodes for name in sn.get_buffer_names()),
         )
-        kernel.min_xblock = n
-        with kernel:
-            self._codegen_node_schedule_body(outer_schedule, kernel)
-            kernel.codegen_body()
-            y_tree, x_tree, _ = kernel.range_trees
-            numels = {"x": m, "r0_": sympy.Integer(n)}
+
+        def buffer_names(snodes):
+            return OrderedSet(name for sn in snodes for name in sn.get_buffer_names())
+
+        def block(tree):
+            return tree.block_size(), tree.block_offset(), tree.named_constants()
+
+        def replay(snodes, numels, blocks, tile_buffers, *, dot_stage, name_suffix):
             roots = kernel.construct_range_trees(
                 None,
                 True,
@@ -4595,23 +4822,24 @@ class SIMDScheduling(BaseScheduling):
                 DerivedIterationRangesRoot(
                     root,
                     numel=root.numel,
-                    block_size=block.block_size(),
-                    block_offset=block.block_offset(),
-                    name_suffix="local",
+                    block_size=blocks[root.prefix][0],
+                    block_offset=blocks[root.prefix][1],
+                    name_suffix=name_suffix,
+                    named_constants=blocks[root.prefix][2],
                 )
-                for root, block in zip(roots, (y_tree, x_tree), strict=True)
+                for root in roots
             )
             with (
-                patch.object(kernel, "is_native_matmul", False),
+                patch.object(kernel, "is_native_matmul", dot_stage),
                 kernel.use_iteration_ranges(range_trees, is_reduction=True),
             ):
                 for tree in range_trees:
                     kernel.iteration_ranges_codegen_header(tree, kernel.body)
                 handler = _NativeMatmulRowLoadHandler(
-                    V.get_ops_handler(), kernel, tile_buffers
+                    V.get_ops_handler(), kernel, tile_buffers, dot_stage=dot_stage
                 )
                 with V.set_ops_handler(handler):
-                    for sn in row_nodes:
+                    for sn in snodes:
                         self._prepare_loop_body(sn._body)
                         ranges = sn.get_ranges()
                         if ranges[1]:
@@ -4620,6 +4848,51 @@ class SIMDScheduling(BaseScheduling):
                             with kernel.disable_reduction():
                                 sn.codegen(kernel.split_and_set_ranges(ranges))
                 kernel.codegen_body()
+            return range_trees
+
+        kernel.min_xblock = n
+        with kernel:
+            self._codegen_node_schedule_body(outer_schedule, kernel)
+            kernel.codegen_body()
+            *row_trees, x_tree, _ = kernel.range_trees
+            if stages is None:
+                (y_tree,) = row_trees
+                replay(
+                    row_nodes,
+                    {"x": rows[0], "r0_": sympy.Integer(n)},
+                    {"x": block(y_tree), "r0_": block(x_tree)},
+                    buffer_names(outer_nodes),
+                    dot_stage=False,
+                    name_suffix="local",
+                )
+                return
+            tile_nodes, width = outer_nodes, n
+            for i, (dot_width, stage_nodes) in enumerate(stages):
+                name_suffix = f"local{i}" if i else "local"
+                # A named block keeps the x and r0_ blocks of a stage distinct
+                # for ops.dot even when two widths are equal.
+                x_block = sympy.Symbol(
+                    f"{name_suffix.upper()}_XBLOCK", integer=True, positive=True
+                )
+                # tl.dot needs every block to be at least 16.
+                x_size = sympy.Integer(max(next_power_of_2(dot_width), 16))
+                *row_trees, x_tree, _ = replay(
+                    stage_nodes,
+                    {
+                        **{tree.prefix: tree.numel for tree in row_trees},
+                        "x": sympy.Integer(dot_width),
+                        "r0_": sympy.Integer(width),
+                    },
+                    {
+                        **{tree.prefix: block(tree) for tree in row_trees},
+                        "x": (x_block, sympy.S.Zero, ((x_block, x_size, True),)),
+                        "r0_": block(x_tree),
+                    },
+                    buffer_names(tile_nodes),
+                    dot_stage=True,
+                    name_suffix=name_suffix,
+                )
+                tile_nodes, width = stage_nodes, dot_width
 
     @staticmethod
     def can_use_32bit_indexing(
