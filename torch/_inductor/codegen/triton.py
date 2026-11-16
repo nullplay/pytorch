@@ -1695,13 +1695,13 @@ class TritonOverrides(OpOverrides):
         orig_a, orig_b = a, b
 
         def is_where_needed(var):
-            # Skip if the variable doesn't have a reduction mask
-            if not any(map(prefix_is_reduction, var.mask_vars)):
-                return False
-
             reduction_range = V.kernel.range_trees[-1]
             if not reduction_range.is_reduction:
                 raise AssertionError("reduction_range must be a reduction")
+
+            # Skip if the variable doesn't have a reduction mask
+            if reduction_range.mask_name() not in var.mask_vars:
+                return False
 
             # Skip if reduction mask was already constant
             if V.kernel._has_constant_mask(reduction_range):
@@ -1825,10 +1825,11 @@ class TritonOverrides(OpOverrides):
         if len(V.kernel.dense_size_list()) < 3:
             raise AssertionError("tl.dot can only do mm and bmm")
 
-        XBLOCK = str(TritonSymbols.block_sizes[SymT.XBLOCK])
-        YBLOCK = str(TritonSymbols.block_sizes[SymT.YBLOCK])
-        Z0_BLOCK = str(TritonSymbols.block_sizes[SymT.Z0_BLOCK])
-        RBLOCK = str(TritonSymbols.block_sizes[SymT.R0_INDEX])
+        # A derived space (see SIMDScheduling._codegen_native_matmul_row_epilogue)
+        # gives its trees other block sizes, e.g. its r0_ uses XBLOCK.
+        blocks = {tree.prefix: tree.block_size_str() for tree in V.kernel.range_trees}
+        XBLOCK, YBLOCK, RBLOCK = blocks["x"], blocks["y"], blocks["r0_"]
+        Z0_BLOCK = blocks.get("z0_", str(TritonSymbols.block_sizes[SymT.Z0_BLOCK]))
 
         a = V.kernel.cse.generate(
             V.kernel.compute,
@@ -3784,6 +3785,23 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
     def dense_size_str(self) -> str:
         return f"[{', '.join(self.dense_size_list())}]"
+
+    def native_matmul_accumulator_sizes(self) -> list[str]:
+        """Block sizes of the (Y, X) native matmul accumulator.
+
+        The accumulator drops R, and Z because bmm keeps Z0_BLOCK=1 to use a
+        2D tl.dot.
+        """
+        dense_sizes = self.dense_size_list()
+        if len(dense_sizes) < 3:
+            raise AssertionError(
+                f"expected at least 3 dense sizes, got {len(dense_sizes)}"
+            )
+        return [
+            dense_sizes[cast("int", tree.tensor_dim)]
+            for tree in self.range_trees
+            if tree.prefix in ("y", "x")
+        ]
 
     def create_constant_mask(self, entry: IterationRangesRoot) -> str:
         if entry.tensor_dim is None:
@@ -6024,12 +6042,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         # Instead, we force Z0_BLOCK to be always 1 during autotune.
         dense_size_str: str
         if self.is_native_matmul:
-            dense_sizes = self.dense_size_list()
-            if len(dense_sizes) < 3:
-                raise AssertionError(
-                    f"expected at least 3 dense sizes, got {len(dense_sizes)}"
-                )
-            xy_sizes_only = [size for size in dense_sizes if "X" in size or "Y" in size]
+            xy_sizes_only = self.native_matmul_accumulator_sizes()
             dense_size_str = f"[{', '.join(xy_sizes_only)}]"
             value_shape = tuple(xy_sizes_only)
         else:
@@ -6405,14 +6418,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             scalar_size_str = f"[{', '.join(self.dense_size_list()[:dim])}]"
             if not isinstance(default, tuple):
                 if reduction_type == "dot":
-                    dense_sizes = self.dense_size_list()
-                    if len(dense_sizes) < 3:
-                        raise AssertionError(
-                            f"expected at least 3 dense sizes, got {len(dense_sizes)}"
-                        )
-                    xy_sizes_only = [
-                        size for size in dense_sizes if "X" in size or "Y" in size
-                    ]
+                    xy_sizes_only = self.native_matmul_accumulator_sizes()
                     accumulator.shape = tuple(xy_sizes_only)
                     dense_size_str = f"[{', '.join(xy_sizes_only)}]"
                     self.body.writeline(

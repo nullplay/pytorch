@@ -1,6 +1,7 @@
 # Owner(s): ["module: inductor"]
 
 
+import itertools
 from collections.abc import Callable
 
 import torch
@@ -511,6 +512,156 @@ class TestNativeMatmulRowReduction(TestCase):
         args = (
             torch.randn(256, 128, dtype=torch.float16),
             torch.randn(128, 16, dtype=torch.float16),
+        )
+        self.check(f, args, fused=False)
+
+
+@inductor_config.patch({"triton.native_matmul": True})
+@instantiate_parametrized_tests
+class TestNativeMatmulDotStage(TestCase):
+    """A native matmul that contracts the N columns of another native matmul's
+    complete rows (a back-to-back GEMM) fuses into that matmul's kernel."""
+
+    def check(self, f, args, *, fused, tol=5e-2):
+        metrics.reset()
+        torch._dynamo.reset()
+        actual, code = run_and_get_code(torch.compile(f), *args)
+        self.assertEqual(actual, f(*args), atol=tol, rtol=tol)
+        self.assertEqual(metrics.generated_kernel_count == 1, fused)
+        return code[0]
+
+    @parametrize("shape", ((8, 32, 32, 16), (2, 2, 3, 4), (5, 37, 24, 20)))
+    def test_bmm_chain(self, shape):
+        # Token mixing: O2[b] = (A[b] @ T[b] + R[b]) @ T[b]^T.
+        def f(A, T, R):
+            return torch.bmm(torch.bmm(A, T) + R, T.transpose(1, 2))
+
+        b, n, l, d = shape
+        args = (
+            torch.randn(b, n, l, dtype=torch.float16),
+            torch.randn(b, l, d, dtype=torch.float16),
+            torch.randn(b, n, d, dtype=torch.float16),
+        )
+        code = self.check(f, args, fused=True)
+        # Only the second product is stored; the first is read from registers.
+        FileCheck().check("tl.dot").check("local_r0_index").check("tl.dot").run(code)
+        FileCheck().check_count("tl.store", 1, exactly=True).run(code)
+
+    def test_mlp(self):
+        def f(x, w1, b1, w2, b2):
+            return torch.relu(x @ w1 + b1) @ w2 + b2
+
+        args = (
+            torch.randn(128, 64, dtype=torch.float16),
+            torch.randn(64, 64, dtype=torch.float16),
+            torch.randn(64, dtype=torch.float16),
+            torch.randn(64, 32, dtype=torch.float16),
+            torch.randn(32, dtype=torch.float16),
+        )
+        self.check(f, args, fused=True)
+
+    def test_padded_lanes(self):
+        # 1 / (x @ w1) is inf past N = 20, where the second tl.dot reduces.
+        def f(x, w1, w2):
+            return (1.0 / (x @ w1)) @ w2
+
+        args = (
+            torch.randn(100, 64, dtype=torch.float16),
+            torch.randn(64, 20, dtype=torch.float16),
+            torch.randn(20, 24, dtype=torch.float16),
+        )
+        code = self.check(f, args, fused=True)
+        FileCheck().check("tl.dot").check("tl.where(local_r0_index_mask").check(
+            "tl.dot"
+        ).run(code)
+
+    def test_stored_intermediate(self):
+        def f(A, T, R):
+            mixed = torch.bmm(A, T)
+            return torch.bmm(mixed + R, T.transpose(1, 2)), mixed
+
+        args = (
+            torch.randn(8, 32, 32, dtype=torch.float16),
+            torch.randn(8, 32, 16, dtype=torch.float16),
+            torch.randn(8, 32, 16, dtype=torch.float16),
+        )
+        self.check(f, args, fused=True)
+
+    def test_epilogue_reading_outer_tile_not_fused(self):
+        # The epilogue reads y in the [M, L] layout of the second product, but
+        # the dot stage holds y with N on r0_.
+        def f(x, w1, w2):
+            y = x @ w1
+            return y @ w2 + y
+
+        args = (
+            torch.randn(64, 32, dtype=torch.float16),
+            torch.randn(32, 32, dtype=torch.float16),
+            torch.randn(32, 32, dtype=torch.float16),
+        )
+        self.check(f, args, fused=False)
+
+    @parametrize("dims", ((64, 64, 64, 32), (64, 128, 96, 64, 16)))
+    def test_mlp_chain(self, dims):
+        # Each product after the first starts a dot stage; equal widths give a
+        # stage the same x and r0_ extents.
+        def f(x, *params):
+            weights, biases = params[0::2], params[1::2]
+            for i, (weight, bias) in enumerate(zip(weights, biases)):
+                x = x @ weight + bias
+                if i < len(weights) - 1:
+                    x = torch.relu(x)
+            return x
+
+        args = [torch.randn(128, dims[0], dtype=torch.float16)]
+        for k, n in itertools.pairwise(dims):
+            args.append(torch.randn(k, n, dtype=torch.float16) / k**0.5)
+            args.append(torch.randn(n, dtype=torch.float16))
+        code = self.check(f, tuple(args), fused=True)
+        FileCheck().check_count("tl.dot", len(dims) - 1, exactly=True).run(code)
+
+    def test_bmm_mlp_chain(self):
+        def f(x, w1, w2, w3):
+            hidden = torch.nn.functional.gelu(torch.bmm(x, w1))
+            return torch.bmm(torch.nn.functional.gelu(torch.bmm(hidden, w2)), w3)
+
+        args = (
+            torch.randn(16, 32, 64, dtype=torch.float16),
+            *(torch.randn(16, 64, 64, dtype=torch.float16) / 8 for _ in range(3)),
+        )
+        self.check(f, args, fused=True)
+
+    def test_residual_across_stages_not_fused(self):
+        # The second stage's epilogue reads h1, which only the first stage
+        # holds in registers, with N on r0_.
+        def f(x, w1, w2, w3):
+            h1 = x @ w1
+            return (torch.relu(h1) @ w2 + h1) @ w3
+
+        args = (
+            torch.randn(64, 32, dtype=torch.float16),
+            torch.randn(32, 32, dtype=torch.float16) / 6,
+            torch.randn(32, 32, dtype=torch.float16) / 6,
+            torch.randn(32, 16, dtype=torch.float16),
+        )
+        self.check(f, args, fused=False)
+
+    @parametrize("case", ("wide_n", "wide_l", "long_k", "transposed"))
+    def test_not_fused(self, case):
+        def f(x, w1, w2):
+            y = x @ w1
+            return (y.T if case == "transposed" else y) @ w2
+
+        m, k, n, l = {
+            "wide_n": (64, 64, 256, 32),
+            "wide_l": (64, 64, 32, 256),
+            "long_k": (64, 1024, 32, 32),
+            "transposed": (64, 32, 64, 16),
+        }[case]
+        args = (
+            torch.randn(m, k, dtype=torch.float16),
+            torch.randn(k, n, dtype=torch.float16) / k**0.5,
+            torch.randn(m if case == "transposed" else n, l, dtype=torch.float16),
         )
         self.check(f, args, fused=False)
 

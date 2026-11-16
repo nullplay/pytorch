@@ -37,6 +37,7 @@ if TYPE_CHECKING:
 
     from torch.utils._ordered_set import OrderedSet
 
+    from ..scheduler import MemoryDepMatch
     from .common import BackendFeature, Kernel
     from .multi_kernel import MultiKernel
 
@@ -67,6 +68,11 @@ class CUDACombinedScheduling(BaseScheduling):
 
     def has_sub_parent_epilogue(self, nodes: Sequence[BaseSchedulerNode]) -> bool:
         return self._triton_scheduling.has_sub_parent_epilogue(nodes)
+
+    def fusion_dependency_matches(
+        self, node1: BaseSchedulerNode, node2: BaseSchedulerNode
+    ) -> tuple[MemoryDepMatch, ...] | None:
+        return self._triton_scheduling.fusion_dependency_matches(node1, node2)
 
     def choose_node_backend(self, node: BaseSchedulerNode) -> BaseScheduling:
         if self._cutlass_scheduling.is_cutlass_template(node):
