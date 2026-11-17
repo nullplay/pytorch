@@ -342,6 +342,28 @@ class TestTritonDotReduction(TestCase):
                 self.assertNotRegex(code, r"extern_kernels\.\w+\(")
                 self.assertEqual(actual, f(*args), atol=1e-4, rtol=1e-4)
 
+    @inductor_config.patch({"max_autotune_gemm": True})
+    def test_mm_plus_mm(self):
+        # Under max-autotune, tuned_mm_plus_mm lowers a @ b + c @ d. It becomes two
+        # native matmuls only if use_native_matmul() accepts them, which it does not
+        # for fp64:
+        #   fp32: triton_red_fused_add_0.run(buf2, arg0_1, arg1_1, arg2_1, arg3_1, ...)
+        #   fp64: extern_kernels._mm_plus_mm(arg0_1, arg1_1, arg2_1, arg3_1, out=buf0)
+        def f(a, b, c, d):
+            return a @ b + c @ d
+
+        for dtype, native in [(torch.float32, True), (torch.float64, False)]:
+            with self.subTest(dtype=dtype):
+                args = [
+                    torch.randn(shape, device=GPU_TYPE, dtype=dtype)
+                    for shape in [(40, 72), (72, 136), (40, 72), (72, 136)]
+                ]
+                torch._dynamo.reset()
+                actual, (code,) = run_and_get_code(torch.compile(f), *args)
+                self.assertEqual("tl.dot" in code, native)
+                self.assertEqual("extern_kernels._mm_plus_mm(" in code, not native)
+                self.assertEqual(actual, f(*args), atol=1e-4, rtol=1e-4)
+
 
 @instantiate_parametrized_tests
 class TestNativeMatmulChoices(TestCase):
