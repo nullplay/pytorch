@@ -52,6 +52,22 @@ if not hasattr(torch.ops.fbgemm, "jagged_to_padded_dense_forward"):
     )
     _define("asynchronous_complete_cumsum(Tensor t_in) -> Tensor", _complete_cumsum)
 
+    def _pack_segments(t_in, lengths, max_length):
+        offsets = _complete_cumsum(lengths)
+        return _jagged_to_padded_dense(t_in, [offsets], [max_length])
+
+    def _pack_segments_backward(data, lengths, total_length, max_length):
+        return _dense_to_jagged(data, [_complete_cumsum(lengths)], total_length)
+
+    _define(
+        "pack_segments(Tensor t_in, Tensor lengths, SymInt max_length) -> Tensor",
+        _pack_segments,
+    )
+    _define(
+        "pack_segments_backward(Tensor data, Tensor lengths, SymInt total_length, SymInt max_length) -> Tensor",
+        _pack_segments_backward,
+    )
+
 fbgemm = torch.ops.fbgemm
 j2pd = fbgemm.jagged_to_padded_dense_forward
 
@@ -109,6 +125,19 @@ class TestLowerFbgemmJaggedOps(TestCase):
             return offsets, j2pd(values, [offsets], [5])
 
         self.check(fn, lengths, values)
+
+    def test_pack_segments(self, device):
+        values = torch.randn(10, 8, device=device)
+        lengths = torch.tensor([2, 0, 3, 5], device=device)
+        dense = torch.randn(4, 5, 8, device=device)
+
+        def fn(values, lengths, dense):
+            offsets = fbgemm.asynchronous_complete_cumsum(lengths)
+            packed = fbgemm.pack_segments(values * 2, lengths, 5)
+            grad = fbgemm.pack_segments_backward(dense, lengths, 10, 5)
+            return offsets, packed + 1, grad
+
+        self.check(fn, values, lengths, dense)
 
 
 instantiate_device_type_tests(TestLowerFbgemmJaggedOps, globals(), allow_xpu=True)
