@@ -1,9 +1,12 @@
 # Owner(s): ["module: inductor"]
 
+import unittest
+
 import torch
 from torch._inductor import config
 from torch._inductor.test_case import run_tests, TestCase
 from torch._inductor.utils import run_and_get_code
+from torch.testing._internal.common_cuda import SM90OrLater
 from torch.testing._internal.common_device_type import instantiate_device_type_tests
 from torch.testing._internal.common_utils import HardwareClassification
 
@@ -138,6 +141,54 @@ class TestLowerFbgemmJaggedOps(TestCase):
             return offsets, packed + 1, grad
 
         self.check(fn, values, lengths, dense)
+
+
+@unittest.skipIf(not SM90OrLater, "bf16 _grouped_mm needs sm90")
+class TestJaggedBmmToGroupedMm(TestCase):
+    hw_classification = HardwareClassification.CUDA
+
+    def check(self, fn, *args, rewritten=True):
+        expected = fn(*args)
+        with config.patch(jagged_bmm_to_grouped_mm=True):
+            actual, code = run_and_get_code(torch.compile(fn, fullgraph=True), *args)
+        self.assertEqual(actual, expected, atol=1e-2, rtol=1e-2)
+        code = "\n".join(code)
+        self.assertEqual("_grouped_mm" in code, rewritten)
+        self.assertEqual("extern_kernels.bmm" in code, not rewritten)
+
+    @staticmethod
+    def inputs(lengths, heads, k=32, n=16):
+        lengths = torch.tensor(lengths, device="cuda")
+        values = torch.randn(
+            int(lengths.sum()), heads * k, device="cuda", dtype=torch.bfloat16
+        )
+        weight = torch.randn(len(lengths), k, n, device="cuda", dtype=torch.bfloat16)
+        return values, lengths, weight
+
+    @staticmethod
+    def fn(values, lengths, weight, T=4):
+        B, K, N = weight.shape
+        H = values.size(1) // K
+        offsets = torch.nn.functional.pad(lengths.cumsum(0), (1, 0))
+        padded = torch.ops.aten._jagged_to_padded_dense_forward(
+            values, [offsets], [T], 0.0
+        )
+        out = torch.bmm(padded.view(B, T * H, K), weight).view(B, T, H * N)
+        # offsets rebuilt from the same lengths, as separate fbgemm ops leave them
+        offsets = torch.nn.functional.pad(lengths.cumsum(0), (1, 0))
+        return torch.ops.aten._padded_dense_to_jagged_forward(
+            out, [offsets], values.size(0)
+        )
+
+    def test_rewrite(self):
+        # the 6-row sequence is longer than T=4: its last 2 output rows are zeros
+        self.check(self.fn, *self.inputs([2, 0, 6, 3], heads=1))
+
+    def test_rewrite_heads(self):
+        self.check(self.fn, *self.inputs([2, 0, 6, 3], heads=2))
+
+    def test_too_many_groups(self):
+        self.check(self.fn, *self.inputs([1] * 1024, heads=1), rewritten=False)
 
 
 instantiate_device_type_tests(TestLowerFbgemmJaggedOps, globals(), allow_xpu=True)

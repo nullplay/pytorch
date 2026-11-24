@@ -13,15 +13,22 @@ the wrapper goes from an extern kernel between two pointwise kernels
 to one kernel that reads values[offsets[b] + t] where t < lengths[b], else padding:
 
     triton_poi_fused_add_mul_0.run(arg1_1, arg0_1, buf0, ...)
+
+jagged_bmm_to_grouped_mm replaces a batched matmul on padded jagged rows,
+`padded_dense_to_jagged(bmm(jagged_to_padded_dense(values), weight))`, with
+`_grouped_mm(values, weight, offs)`, which multiplies only the real rows: B
+padded GEMMs of T rows each become one grouped GEMM over the L jagged rows.
 """
 
 from __future__ import annotations
 
+import sys
 from typing import Any
 
 import torch
 from torch._guards import detect_fake_mode
 from torch.fx import Graph, Node
+from torch.fx.experimental.symbolic_shapes import statically_known_true
 from torch.fx.node import map_arg
 
 
@@ -143,3 +150,91 @@ def lower_fbgemm_jagged_ops(graph: Graph) -> None:
         if new is not None:
             node.replace_all_uses_with(new)
             graph.erase_node(node)
+
+
+_VIEWS = (aten.view.default, aten.reshape.default, aten._unsafe_view.default)
+# The bf16 CUDA _grouped_mm kernel (CUTLASS, sm90) takes fewer than 1024 groups.
+_MAX_GROUPS = 1023
+
+
+def _offsets_key(offsets: Node) -> Node:
+    """Offsets [0, cumsum(lengths)] compare equal through their lengths, whether
+    built as cumsum(pad(lengths)) or pad(cumsum(lengths))."""
+    ops = (aten.cumsum.default, aten.constant_pad_nd.default)
+    inner = offsets.args[0] if offsets.target in ops else None
+    if not isinstance(inner, Node) or inner.target not in ops:
+        return offsets
+    if inner.target is offsets.target:
+        return offsets
+    pad_args: Any = (offsets if offsets.target is ops[1] else inner).args
+    if list(pad_args[1]) != [1, 0] or (len(pad_args) > 2 and pad_args[2] != 0):
+        return offsets
+    lengths: Any = inner.args[0]
+    return lengths
+
+
+def _rewrite_jagged_bmm(graph: Graph, fake_mode: Any, bmm: Node) -> None:
+    lhs, weight = bmm.args
+    padded = lhs
+    while isinstance(padded, Node) and padded.target in _VIEWS:
+        padded = padded.args[0]
+    out = bmm
+    while len(out.users) == 1 and next(iter(out.users)).target in _VIEWS:
+        out = next(iter(out.users))
+    if len(out.users) != 1:
+        return
+    jagged = next(iter(out.users))
+    if not (
+        isinstance(padded, Node)
+        and padded.target is aten._jagged_to_padded_dense_forward.default
+        and jagged.target is aten._padded_dense_to_jagged_forward.default
+    ):
+        return
+    pargs: Any = padded.args
+    jargs: Any = jagged.args
+    values, max_length, total = pargs[0], pargs[2][0], jargs[2]
+    offsets, jagged_offsets = _only_offsets(pargs[1]), _only_offsets(jargs[1])
+    if offsets is None or jagged_offsets is None:
+        return
+    if _offsets_key(offsets) is not _offsets_key(jagged_offsets):
+        return
+    (L, C), (B, M, K), N = _val(values).shape, _val(lhs).shape, _val(weight).shape[2]
+    if not all(isinstance(d, int) for d in (C, K, N)) or C % K or K % 8 or N % 8:
+        return
+    H, T = C // K, _val(padded).shape[1]
+    if not (
+        _val(values).dtype is torch.bfloat16
+        and _val(weight).dtype is torch.bfloat16
+        and _val(values).is_cuda
+        and torch.version.hip is None
+        and torch.cuda.get_device_capability(_val(values).device) >= (9, 0)
+        and statically_known_true(B <= _MAX_GROUPS)
+        and statically_known_true(M == T * H)
+        and statically_known_true(_val(total) == L)
+        and tuple(_val(out).shape[2:]) == (H * N,)
+    ):
+        return
+    b = _Builder(graph, jagged, fake_mode)
+    rows = b(aten.reshape.default, values, [-1, K])
+    ends = b(aten.slice.Tensor, offsets, 0, 1, sys.maxsize)
+    if H != 1:
+        ends = b(aten.mul.Tensor, ends, H)
+    ends = b(torch.ops.prims.convert_element_type.default, ends, torch.int32)
+    result = b(aten._grouped_mm.default, rows, weight, ends)
+    result = b(aten.reshape.default, result, [-1, H * N])
+    # The original drops the rows of sequences longer than max_length and writes
+    # zeros there; going through the padded layout does the same, and the pair
+    # fuses into one masked copy.
+    to_padded = aten._jagged_to_padded_dense_forward.default
+    result = b(to_padded, result, [offsets], [max_length], 0.0)
+    result = b(aten._padded_dense_to_jagged_forward.default, result, [offsets], total)
+    jagged.replace_all_uses_with(result)
+    graph.erase_node(jagged)
+
+
+def jagged_bmm_to_grouped_mm(graph: Graph) -> None:
+    fake_mode = detect_fake_mode([_val(n) for n in graph.find_nodes(op="placeholder")])
+    if fake_mode is None:
+        return
+    for bmm in graph.find_nodes(op="call_function", target=aten.bmm.default):
+        _rewrite_jagged_bmm(graph, fake_mode, bmm)
