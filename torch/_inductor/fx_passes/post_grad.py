@@ -416,6 +416,13 @@ def post_grad_passes(gm: torch.fx.GraphModule, is_inference: bool):
             lower_fbgemm_jagged_ops
         )
 
+    if config.jagged_bmm_to_grouped_mm:
+        from .jagged import jagged_bmm_to_grouped_mm
+
+        GraphTransformObserver(gm, "jagged_bmm_to_grouped_mm").apply_graph_pass(
+            jagged_bmm_to_grouped_mm
+        )
+
     if torch._C._has_mkldnn:
         if (
             config.cpp.enable_grouped_gemm_template

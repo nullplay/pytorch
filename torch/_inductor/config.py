@@ -360,6 +360,10 @@ post_grad_custom_post_pass: torch._inductor.custom_graph_pass.CustomGraphPassTyp
 # fuses, see fx_passes/jagged.py.
 lower_fbgemm_jagged_ops = False
 
+# Replace bmm on padded jagged rows (jagged -> padded -> bmm -> jagged) with
+# _grouped_mm on the jagged rows, see fx_passes/jagged.py. bf16, CUDA sm90+.
+jagged_bmm_to_grouped_mm = False
+
 # Allow users to pass in custom partition function
 custom_partitioner_fn: torch._inductor.custom_graph_pass.CustomPartitionerFnType = None
 
