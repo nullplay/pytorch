@@ -68,6 +68,12 @@ class _Builder:
         return node
 
 
+def _complete_cumsum(b: _Builder, lengths: Node) -> Node:
+    padded = b(aten.constant_pad_nd.default, lengths, [1, 0], 0)
+    # fbgemm keeps int32 offsets int32; cumsum would promote them to int64.
+    return b(aten.cumsum.default, padded, 0, dtype=_val(lengths).dtype)
+
+
 def _to_padded(
     b: _Builder, values: Node, offsets: Node, max_length: Any, padding_value: float
 ) -> Node | None:
@@ -98,11 +104,17 @@ def _lower_fbgemm_op(b: _Builder, node: Node) -> Node | None:
     args: Any = node.args
     if name == "fbgemm::asynchronous_complete_cumsum":
         lengths = args[0]
-        if _val(lengths).dim() != 1:
+        return _complete_cumsum(b, lengths) if _val(lengths).dim() == 1 else None
+    if name == "fbgemm::pack_segments":
+        t_in, lengths, max_length = args
+        if _val(t_in).dim() not in (1, 2) or _val(lengths).dim() != 1:
             return None
-        padded = b(aten.constant_pad_nd.default, lengths, [1, 0], 0)
-        # fbgemm keeps int32 offsets int32; cumsum would promote them to int64.
-        return b(aten.cumsum.default, padded, 0, dtype=_val(lengths).dtype)
+        return _to_padded(b, t_in, _complete_cumsum(b, lengths), max_length, 0.0)
+    if name == "fbgemm::pack_segments_backward":
+        data, lengths, total_length = args[:3]
+        if _val(data).dim() != 3 or _val(lengths).dim() != 1:
+            return None
+        return _to_jagged(b, data, _complete_cumsum(b, lengths), total_length)
     if name == "fbgemm::jagged_to_padded_dense_forward":
         offsets = _only_offsets(args[1])
         if offsets is None:
