@@ -355,6 +355,11 @@ var_std_reduction_dedup = False
 post_grad_custom_pre_pass: torch._inductor.custom_graph_pass.CustomGraphPassType = None
 post_grad_custom_post_pass: torch._inductor.custom_graph_pass.CustomGraphPassType = None
 
+# Rewrite fbgemm_gpu's jagged ops (jagged_to_padded_dense, dense_to_jagged,
+# asynchronous_complete_cumsum) into aten ops that Inductor fuses, see
+# fx_passes/jagged.py.
+lower_fbgemm_jagged_ops = False
+
 # Allow users to pass in custom partition function
 custom_partitioner_fn: torch._inductor.custom_graph_pass.CustomPartitionerFnType = None
 
