@@ -332,6 +332,19 @@ class TestJaggedAtenLowerings(InductorTestCase):
                 )
             )
 
+    def test_jagged_to_padded_dense_integer_values(self, device):
+        # int64 values above 2**24 are not exact in float32
+        values = 2**40 + torch.arange(40, device=device).view(10, 4)
+        offsets = torch.tensor([0, 2, 5, 10], device=device)
+
+        def fn(values, offsets):
+            return torch.ops.aten._jagged_to_padded_dense_forward(
+                values, [offsets], [6], -1.0
+            )
+
+        actual = torch.compile(fn, fullgraph=True)(values, offsets)
+        self.assertEqual(actual, fn(values, offsets))
+
     def test_padded_dense_to_jagged_fused_or_fallback(self, device):
         values = torch.randn(10, 5, device=device)
         offsets = torch.tensor([0, 1, 3, 8, 10], device=device, dtype=torch.int64)

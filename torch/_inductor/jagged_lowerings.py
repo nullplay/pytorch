@@ -111,8 +111,14 @@ def register_jagged_ops():
     # Avoid circular import by importing here
     from .lowering import fallback_handler, is_integer_type, register_lowering
 
+    # type_promotion_kind=None: the default promotion counts the float
+    # padding_value as an operand and upcasts integer values, so for int64
+    # values the kernel did `tmp10 = tmp9.to(tl.float32)` into a float32
+    # buffer (eager returns int64; values above 2**24 also got rounded).
     # pyre-ignore[56]
-    @register_lowering(torch.ops.aten._jagged_to_padded_dense_forward.default)
+    @register_lowering(
+        torch.ops.aten._jagged_to_padded_dense_forward.default, type_promotion_kind=None
+    )
     def _jagged_to_padded_dense_forward(
         jagged_values: TensorBox,
         jagged_offsets: list[TensorBox],
