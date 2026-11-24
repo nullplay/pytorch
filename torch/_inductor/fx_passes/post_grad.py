@@ -409,6 +409,13 @@ def post_grad_passes(gm: torch.fx.GraphModule, is_inference: bool):
             post_grad_custom_pre_pass
         )
 
+    if config.lower_fbgemm_jagged_ops:
+        from .jagged import lower_fbgemm_jagged_ops
+
+        GraphTransformObserver(gm, "lower_fbgemm_jagged_ops").apply_graph_pass(
+            lower_fbgemm_jagged_ops
+        )
+
     if torch._C._has_mkldnn:
         if (
             config.cpp.enable_grouped_gemm_template
